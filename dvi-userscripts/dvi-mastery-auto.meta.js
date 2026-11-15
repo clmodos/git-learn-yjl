@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [DVI]精通自动制造（精通助手伴随脚本）
 // @namespace    local.dvi.mastery.automation
-// @version      0.2.1
+// @version      0.2.2
 // @description  配合精通助手 1.2.10 及以上（含 1.2.12），自动补料制造，统计金币和精通收益。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*

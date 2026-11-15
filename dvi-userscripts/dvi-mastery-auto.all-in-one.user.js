@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [DVI]精通自动制造（内置精通助手 1.2.12）
 // @namespace    local.dvi.mastery.automation
-// @version      0.2.1
+// @version      0.2.2
 // @description  单文件版：内置 [DVI]精通助手 1.2.12 数据适配层（作者 SHIIN，CC-BY-ND），自动补料制造并统计金币与精通收益。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*
