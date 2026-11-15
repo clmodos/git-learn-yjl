@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         [DVI]自动喝药
 // @namespace    local.dvi.autodrink
-// @version      0.1.1
-// @description  药水剩余时间低于设定的阈值时，自动按指定品质与瓶数喝药；类型、阈值、品质、瓶数全部可自定义，读的是游戏自己的增益数据。
+// @version      0.2.1
+// @description  药水剩余时间低于阈值时自动补：背包有就地喝，只有仓库就走到仓库喝，仓库也没有就自动去市场买指定品质瓶数再喝。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*
 // @match        https://cn.deepveinidle.com/*
@@ -20,10 +20,10 @@
   const KEY = '__DVI_AUTODRINK__';
   if (window[KEY]) return;
   const PREF = 'dvi.autodrink.settings.v1';
-  // 游戏常量：稀有度步长 1000，每 tick 600ms，一瓶 6000 tick（= 1 小时），单次最多 10000 瓶。
-  const RARITY_STRIDE = 1000, TICK_MS = 600, BOTTLE_TICKS = 6000, MAX_DRINK = 1e4, COOLDOWN = 4000;
+  const PRICES_KEY = 'dvi.autodrink.prices.v1';
+  // 游戏常量：稀有度步长 1000、每 tick 600ms、一瓶 6000 tick（1 小时）、单次最多 10000 瓶、仓库 20 格内可取用。
+  const RARITY_STRIDE = 1000, TICK_MS = 600, BOTTLE_TICKS = 6000, MAX_DRINK = 1e4, BANK_REACH = 20;
   const RARITIES = ['普通', '罕见', '稀有', '史诗', '传说'];
-  // 药水基础 id 与它作用的增益键，和游戏自己的药水表一一对应。
   const POTIONS = [
     { base: 220, kind: 'gatherer', name: '采集者药剂', effect: '采集经验 +5%' },
     { base: 221, kind: 'hunter', name: '猎人酿剂', effect: '稀有发现 +25%' },
@@ -34,7 +34,7 @@
     { base: 226, kind: 'nourish', name: '滋养药剂', effect: '食物治疗 +25%' },
     { base: 227, kind: 'haste', name: '急速药剂', effect: '攻击速度 +20%' }
   ];
-  const defaults = { potions: [223], rarity: 0, bottles: 1, threshold: 24, dry: true, x: null, y: null };
+  const defaults = { potions: [223], rarity: 0, bottles: 1, threshold: 24, autoBuy: true, dry: true, x: null, y: null };
   let settings = { ...defaults };
   try {
     const saved = JSON.parse(localStorage.getItem(PREF) || '{}');
@@ -42,11 +42,13 @@
     if (Number.isSafeInteger(saved.rarity) && saved.rarity >= 0 && saved.rarity < RARITIES.length) settings.rarity = saved.rarity;
     if (Number.isSafeInteger(saved.bottles) && saved.bottles >= 1 && saved.bottles <= MAX_DRINK) settings.bottles = saved.bottles;
     if (Number.isFinite(saved.threshold) && saved.threshold >= 0) settings.threshold = saved.threshold;
+    if (typeof saved.autoBuy === 'boolean') settings.autoBuy = saved.autoBuy;
     if (typeof saved.dry === 'boolean') settings.dry = saved.dry;
     if (Number.isFinite(saved.x) && Number.isFinite(saved.y)) { settings.x = saved.x; settings.y = saved.y; }
   } catch { /* 没有存档就按默认值走 */ }
-  let running = false, drank = 0, status = '待开始：勾选要维持的药水', lastNote = '';
-  const sentAt = new Map();
+  let running = false, drank = 0, status = '待开始：勾选要维持的药水';
+  let prices = null, pricesAt = 0, lastNote = '', awayNoted = false;
+  const sentAt = new Map(), boughtAt = new Map();
   const history = [];
   const life = new AbortController();
   const q = (selector, scope = document) => scope?.querySelector(selector) || null;
@@ -63,23 +65,48 @@
     const tick = Number(current?.lastTick) || 0;
     return Math.max(0, (expires - tick) * TICK_MS) / 3600000;
   };
-  const carried = (current, itemId) => {
-    const pack = Array.isArray(current?.pack) ? current.pack : [];
-    return pack.reduce((sum, row) => row?.itemId === itemId ? sum + (Number.isSafeInteger(row.qty) ? row.qty : 0) : sum, 0);
+  const packQty = (current, itemId) => (Array.isArray(current?.pack) ? current.pack : [])
+    .reduce((sum, row) => row?.itemId === itemId ? sum + (Number.isSafeInteger(row.qty) ? row.qty : 0) : sum, 0);
+  const bankQty = (current, itemId) => current?.bank && typeof current.bank === 'object' ? Number(current.bank[itemId]) || 0 : 0;
+  const banks = () => {
+    const list = window.deepvein?.banks;
+    if (Array.isArray(list) && list.length) return list.filter(row => Number.isFinite(row?.x) && Number.isFinite(row?.y));
+    return [{ id: 1, x: 200, y: 82 }, { id: 2, x: 110, y: 177 }];
   };
-  const inBank = (current, itemId) => {
-    const bank = current?.bank;
-    return bank && typeof bank === 'object' ? Number(bank[itemId]) || 0 : 0;
+  const nearestBank = (current) => {
+    const x = Number(current?.x) || 0, y = Number(current?.y) || 0;
+    let best = null, distance = Infinity;
+    for (const bank of banks()) {
+      const span = Math.max(Math.abs(x - bank.x), Math.abs(y - bank.y));
+      if (span < distance) { distance = span; best = bank; }
+    }
+    return best ? { ...best, distance } : null;
   };
+  async function loadPrices() {
+    if (prices && Date.now() - pricesAt < 300000) return prices;
+    try {
+      const response = await fetch('/api/market/prices.json', { credentials: 'omit', cache: 'no-cache' });
+      if (!response.ok) return prices;
+      const data = await response.json();
+      if (data?.items && typeof data.items === 'object') { prices = data.items; pricesAt = Date.now(); }
+    } catch { /* 拿不到行情就不买 */ }
+    return prices;
+  }
   function drink(potion, itemId, qty) {
     const s = session();
     if (!s) return false;
     const message = { t: 'drink', itemId, qty };
     const apply = current => {
+      let left = qty;
       const row = current?.pack?.find(cell => cell.itemId === itemId);
       if (row) {
-        row.qty -= qty;
+        const take = Math.min(left, row.qty);
+        row.qty -= take; left -= take;
         if (row.qty <= 0) current.pack = current.pack.filter(cell => cell !== row);
+      }
+      if (left > 0 && current?.bank) {
+        const next = Math.max(0, (Number(current.bank[itemId]) || 0) - left);
+        if (next === 0) delete current.bank[itemId]; else current.bank[itemId] = next;
       }
       const base = Math.max(Number(current?.brews?.[potion.kind]) || 0, Number(current?.lastTick) || 0);
       current.brews ??= {};
@@ -89,8 +116,35 @@
     else { s.post(message); apply(s.state); }
     drank += qty;
     sentAt.set(potion.kind, Date.now());
-    log(`已喝 ${potion.name}（${RARITIES[settings.rarity]}）× ${qty}，剩余约 ${remainHours(state(), potion.kind).toFixed(1)} 小时`);
+    log(`已喝 ${potion.name}（${RARITIES[settings.rarity]}）× ${qty}`);
     return true;
+  }
+  function buy(potion, itemId, qty) {
+    const s = session();
+    const quote = prices?.[itemId] || prices?.[String(itemId)];
+    const price = Number(quote?.lowestSell);
+    const stock = Number(quote?.sellQty);
+    if (!Number.isFinite(price) || price <= 0) return '报价缺失';
+    if (Number.isFinite(stock) && stock < qty) return `市场只有 ${stock} 瓶`;
+    const message = { t: 'marketBuy', itemId, qty, price };
+    if (typeof s.intent === 'function') s.intent(message, () => {});
+    else s.post(message);
+    boughtAt.set(itemId, Date.now());
+    log(`下单购买 ${potion.name}（${RARITIES[settings.rarity]}）× ${qty}，限价 ${price}`);
+    return null;
+  }
+  function cancelStaleBuys(itemId) {
+    const s = session(), since = boughtAt.get(itemId);
+    if (!s || !since || Date.now() - since < 6000) return;
+    const orders = Array.isArray(s.orders) ? s.orders : [];
+    for (const order of orders) {
+      if (order?.side === 'buy' && order.itemId === itemId && order.qtyRemaining > 0) {
+        if (typeof s.intent === 'function') s.intent({ t: 'marketCancel', orderId: order.id }, () => {});
+        else s.post({ t: 'marketCancel', orderId: order.id });
+        log('购买没成交，已撤单（价格可能刚变）');
+      }
+    }
+    boughtAt.delete(itemId);
   }
   function check(force = false) {
     const current = state();
@@ -105,10 +159,9 @@
       const itemId = potion.base + settings.rarity * RARITY_STRIDE;
       const line = document.createElement('div');
       line.innerHTML = '<span></span><b></b>';
-      line.firstChild.textContent = `${potion.name}（${RARITIES[settings.rarity]}）`;
+      line.firstChild.textContent = `${potion.name}（${RARITIES[settings.rarity]}）· 仓 ${bankQty(current, itemId)} / 身 ${packQty(current, itemId)}`;
       line.lastChild.textContent = hours >= 0.05 ? `${hours.toFixed(1)} 小时` : '未生效';
       line.lastChild.style.color = hours < settings.threshold ? '#f0a35e' : '#9ed36b';
-      line.dataset.item = String(itemId);
       return line;
     }));
     if (!running) return;
@@ -117,21 +170,33 @@
       const hours = remainHours(current, potion.kind);
       if (hours >= settings.threshold) continue;
       const itemId = potion.base + settings.rarity * RARITY_STRIDE;
-      const have = carried(current, itemId);
-      if (!have) {
-        const bank = inBank(current, itemId);
-        notes.push(bank
-          ? `${potion.name}：背包没有，仓库有 ${bank} 瓶（需到仓库附近才能喝）`
-          : `${potion.name}：背包和仓库都没有${RARITIES[settings.rarity]}品`);
+      const want = settings.bottles;
+      const carried = packQty(current, itemId), stored = bankQty(current, itemId);
+      if (!force && Date.now() - (sentAt.get(potion.kind) || 0) < 4000) continue;
+      if (carried > 0) {
+        const qty = Math.min(want, carried, MAX_DRINK);
+        if (settings.dry) notes.push(`试运行：将喝 ${potion.name} × ${qty}（身上）`);
+        else drink(potion, itemId, qty);
         continue;
       }
-      const qty = Math.min(settings.bottles, have, MAX_DRINK);
-      if (settings.dry) {
-        notes.push(`试运行：将喝 ${potion.name} × ${qty}（剩余 ${hours.toFixed(1)} 小时 < ${settings.threshold}）`);
+      if (stored > 0) {
+        // 仓库里的药只能在仓库/家附近喝；不在就安静等着，绝不为了喝药去走路打断工作。
+        const bank = nearestBank(current);
+        if (!bank || bank.distance > BANK_REACH) {
+          if (!awayNoted) { awayNoted = true; notes.push(`${potion.name}：仓库有 ${stored} 瓶，等角色回家/到仓库时自动喝`); }
+          continue;
+        }
+        awayNoted = false;
+        const qty = Math.min(want, stored, MAX_DRINK);
+        if (settings.dry) notes.push(`试运行：将从仓库喝 ${potion.name} × ${qty}`);
+        else drink(potion, itemId, qty);
         continue;
       }
-      if (!force && Date.now() - (sentAt.get(potion.kind) || 0) < COOLDOWN) continue;
-      drink(potion, itemId, qty);
+      cancelStaleBuys(itemId);
+      if (!settings.autoBuy) { notes.push(`${potion.name}：仓库和身上都没有，自动购买已关`); continue; }
+      if (boughtAt.get(itemId) && Date.now() - boughtAt.get(itemId) < 20000) { notes.push(`${potion.name}：已下单，等到货`); continue; }
+      const issue = buy(potion, itemId, Math.min(want, MAX_DRINK));
+      if (issue) notes.push(`${potion.name}：${issue}`);
     }
     const note = notes.join('；');
     if (note && note !== lastNote) { lastNote = note; log(note); }
@@ -140,18 +205,18 @@
   host.id = 'dvi-autodrink';
   const ui = host.attachShadow({ mode: 'open' });
   ui.innerHTML = `<style>
-    :host{all:initial;position:fixed;left:12px;top:120px;z-index:2147483000;width:330px;max-width:calc(100% - 24px);color:#f3e8d4;font:13px/1.5 system-ui,sans-serif;color-scheme:dark}
+    :host{all:initial;position:fixed;left:12px;top:120px;z-index:2147483000;width:348px;max-width:calc(100% - 24px);color:#f3e8d4;font:13px/1.5 system-ui,sans-serif;color-scheme:dark}
     *{box-sizing:border-box}section{border:1px solid #94714a;border-radius:10px;background:#211b15;box-shadow:0 8px 30px #0008;overflow:hidden}
     header{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:9px 12px;background:#34281c}[data-drag]{cursor:move;touch-action:none;user-select:none}
     strong{font-size:14px}button{font:inherit;min-height:30px;padding:4px 10px;border:1px solid #8b7050;border-radius:5px;color:inherit;background:#3c3023;cursor:pointer}
     button:disabled{opacity:.5;cursor:default}button.primary{background:#e5b768;border-color:#f4ce83;color:#21180c;font-weight:700}button.stop{background:#63372e;border-color:#b37662}
-    main{padding:10px 12px;max-height:min(60dvh,540px);overflow:auto}p{margin:0 0 8px;font-size:12px;color:#c9bca8}
+    main{padding:10px 12px;max-height:min(62dvh,560px);overflow:auto}p{margin:0 0 8px;font-size:12px;color:#c9bca8}
     .list{display:grid;grid-template-columns:1fr;gap:3px;margin:6px 0 10px}label{display:flex;align-items:center;gap:6px;font-size:12px;color:#ddd0bb}
     input[type=checkbox]{width:16px;height:16px;accent-color:#e8bd72}label small{margin-left:auto;color:#9d8d76;font-size:11px}
     .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}label.field{flex-direction:column;align-items:stretch;gap:3px}
     input[type=number],select{width:100%;min-height:30px;border:1px solid #796447;background:#17130f;border-radius:4px;padding:4px 6px;color:#fff;font:inherit}
     .row{display:flex;gap:6px;margin:8px 0}.row button{flex:1}
-    .table{margin:8px 0 0;border-top:1px solid #4d3a26;padding-top:6px;font-size:12px;color:#d8c8ac;max-height:140px;overflow:auto}
+    .table{margin:8px 0 0;border-top:1px solid #4d3a26;padding-top:6px;font-size:12px;color:#d8c8ac;max-height:150px;overflow:auto}
     .table div{display:flex;justify-content:space-between;gap:8px;padding:2px 0}.table b{font-variant-numeric:tabular-nums}
     .status{padding:8px 12px;border-top:1px solid #65513a;background:#2b241a;color:#f4d89e;font-size:12px;overflow-wrap:anywhere}
     details{margin-top:8px;font-size:12px;color:#c9bca8}summary{cursor:pointer}ol{padding-left:18px;max-height:110px;overflow:auto}li{margin:3px 0;overflow-wrap:anywhere}
@@ -159,14 +224,15 @@
   </style><section aria-label="自动喝药">
     <header data-drag><strong data-drag>自动喝药</strong><button data-act="collapse" aria-expanded="true">收起</button></header>
     <main>
-      <p>读的是游戏自己的增益数据：低于阈值就从<strong>背包</strong>喝下指定品质的瓶数。背包没有会在下面提示仓库存量。</p>
+      <p>读游戏自己的增益数据。低于阈值时：<b>身上有就地喝</b>；只有仓库就走到仓库喝；都没有就按市场最低价自动买够再喝。</p>
       <div class="list" data-potions></div>
       <div class="fields">
         <label class="field">低于多少小时<input type="number" min="0" step="1" data-act="threshold"></label>
         <label class="field">每次喝几瓶<input type="number" min="1" step="1" data-act="bottles"></label>
         <label class="field">喝哪个品质<select data-act="rarity"></select></label>
-        <label class="field">&nbsp;<span style="font-size:11px;color:#9d8d76">每瓶约 1 小时</span></label>
+        <label class="field">&nbsp;<span style="font-size:11px;color:#9d8d76">每瓶约 1 小时，库存不足就有多少喝多少</span></label>
       </div>
+      <label><input type="checkbox" data-act="autoBuy"> 仓库没有时自动去市场买</label>
       <label><input type="checkbox" data-act="dry"> 试运行（只提示，不真的喝）</label>
       <div class="row"><button class="primary" data-act="start">开始自动喝药</button><button data-act="stop" disabled>停止</button></div>
       <div class="table" data-table></div>
@@ -196,6 +262,7 @@
   raritySelect.value = String(settings.rarity);
   q('[data-act="threshold"]', ui).value = settings.threshold;
   q('[data-act="bottles"]', ui).value = settings.bottles;
+  q('[data-act="autoBuy"]', ui).checked = settings.autoBuy;
   q('[data-act="dry"]', ui).checked = settings.dry;
   function save() {
     try { localStorage.setItem(PREF, JSON.stringify(settings)); } catch { /* 存不下只影响下次启动 */ }
@@ -205,7 +272,8 @@
     q('[data-act="start"]', ui).disabled = running;
     q('[data-act="stop"]', ui).disabled = !running;
     q('[data-act="dry"]', ui).checked = settings.dry;
-    for (const input of ui.querySelectorAll('[data-potion],[data-act="threshold"],[data-act="bottles"],[data-act="rarity"]')) input.disabled = running;
+    q('[data-act="autoBuy"]', ui).checked = settings.autoBuy;
+    for (const input of ui.querySelectorAll('[data-potion],[data-act="threshold"],[data-act="bottles"],[data-act="rarity"],[data-act="autoBuy"]')) input.disabled = running;
     q('[data-history]', ui).replaceChildren(...history.map(text => Object.assign(document.createElement('li'), { textContent: text })));
   }
   function place() {
@@ -214,7 +282,6 @@
     settings.x = Math.min(Math.max(8, settings.x), Math.max(8, innerWidth - rect.width - 8));
     settings.y = Math.min(Math.max(8, settings.y), Math.max(8, innerHeight - rect.height - 8));
     host.style.left = `${settings.x}px`; host.style.top = `${settings.y}px`;
-    host.style.right = 'auto';
   }
   const header = q('header', ui);
   let dragState = null;
@@ -223,7 +290,6 @@
     const rect = host.getBoundingClientRect();
     dragState = { id: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
     header.setPointerCapture(event.pointerId);
-    host.style.right = 'auto';
     event.preventDefault();
   }, { signal: life.signal });
   header.addEventListener('pointermove', event => {
@@ -252,9 +318,9 @@
     }
     if (action === 'start') {
       if (!settings.potions.length) { log('请至少勾选一种药水'); return; }
-      running = true; sentAt.clear(); lastNote = '';
-      log(settings.dry ? '已开始试运行：只提示，不会喝' : `已开始：低于 ${settings.threshold} 小时就喝 ${RARITIES[settings.rarity]}`);
-      paint(); check(); return;
+      running = true; sentAt.clear(); boughtAt.clear(); lastNote = ''; awayNoted = false;
+      log(settings.dry ? '已开始试运行：只提示，不会喝' : `已开始：低于 ${settings.threshold} 小时就补 ${RARITIES[settings.rarity]}`);
+      paint(); check(true); void loadPrices().then(() => check(true)); return;
     }
     if (action === 'stop') { running = false; log('已停止'); paint(); }
   }, { signal: life.signal });
@@ -267,6 +333,7 @@
     }
     if (el.dataset.act === 'rarity') { settings.rarity = Number(el.value); if (!running) save(); check(); return; }
     if (el.dataset.act === 'dry') { settings.dry = el.checked; save(); paint(); return; }
+    if (el.dataset.act === 'autoBuy') { settings.autoBuy = el.checked; save(); paint(); return; }
     if (el.dataset.act === 'threshold' || el.dataset.act === 'bottles') {
       const value = Number(el.value);
       if (!Number.isFinite(value) || value < 0) { el.value = String(settings.threshold); return; }
@@ -276,14 +343,12 @@
     }
   }, { signal: life.signal });
   window[KEY] = {
-    version: '0.1.0',
-    get state() { return { running, drank, dry: settings.dry, threshold: settings.threshold, rarity: settings.rarity, bottles: settings.bottles, potions: settings.potions, status }; },
-    check, remainHours, pause: () => { running = false; paint(); }
+    version: '0.2.0',
+    get state() { return { running, drank, dry: settings.dry, autoBuy: settings.autoBuy, threshold: settings.threshold, rarity: settings.rarity, bottles: settings.bottles, potions: settings.potions, status }; },
+    check, remainHours, nearestBank, pause: () => { running = false; paint(); }
   };
   window.addEventListener('pagehide', () => { running = false; }, { signal: life.signal });
-  const mount = () => (document.body || document.documentElement).append(host);
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
-  else mount();
+  document.body.append(host);
   place();
   paint();
   check();

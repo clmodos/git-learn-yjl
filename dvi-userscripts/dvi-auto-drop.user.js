@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [DVI]自动丢弃资源
 // @namespace    local.dvi.autodrop
-// @version      0.1.1
+// @version      0.1.2
 // @description  只丢掉背包里指定稀有度的资源（矿石、木材、鱼、金属锭、作物），装备、贵重品、药水、食物永不触碰；默认试运行。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*
@@ -20,7 +20,8 @@
   const KEY = '__DVI_AUTODROP__';
   if (window[KEY]) return;
   const PREF = 'dvi.autodrop.settings.v1';
-  const NAMES_KEY = 'dvi.autodrop.names.v1';
+  const ZH_KEY = 'dvi.autodrop.zhnames.v1';
+  const NAMES_KEY = 'dvi.autodrop.names.v2';
   // 游戏内编码：稀有度步长 1000，品质+强化步长 10000，单条丢弃上限 1e6。
   const RARITY_STRIDE = 1000, PLUS_STRIDE = 1e4, MAX_DROP = 1e6, BATCH = 20;
   const RARITIES = ['普通', '罕见', '稀有', '史诗', '传说'];
@@ -31,7 +32,7 @@
     { id: 'fish', name: '鱼', ranges: [[20, 27]], on: true },
     { id: 'bars', name: '金属锭', ranges: [[40, 44]], on: true },
     { id: 'crops', name: '作物', ranges: [[160, 179], [190, 199]], on: true },
-    { id: 'materials', name: '材料', ranges: [[180, 180], [208, 208], [240, 252], [300, 303], [359, 359], [688, 689], [697, 697], [707, 707], [714, 714], [731, 740], [764, 764], [776, 776], [778, 779]], on: false },
+    { id: 'materials', name: '材料（含贵重碎片，慎选）', ranges: [[180, 180], [208, 208], [240, 252], [300, 303], [359, 359], [688, 689], [697, 697], [707, 707], [714, 714], [731, 740], [764, 764], [776, 776], [778, 779]], on: false },
     { id: 'gems', name: '宝石', ranges: [[293, 297]], on: false }
   ];
   const familyOf = base => FAMILIES.find(row => row.ranges.some(([from, to]) => base >= from && base <= to)) || null;
@@ -59,7 +60,7 @@
   const itemName = (base, rarity) => {
     for (let id = base; id < base + RARITIES.length * RARITY_STRIDE; id += RARITY_STRIDE) {
       const row = names[id];
-      if (row) return row.n || `#${base}`;
+      if (row?.n) return zhName(row.n);
     }
     return `#${base}`;
   };
@@ -108,27 +109,61 @@
     if (!running || settings.dry || !rows.length) return;
     for (const row of rows.slice(0, BATCH)) drop(row);
   }
+  let zhNames = {};
+  const zhName = value => zhNames[value] || value;
+  // 物品官方中文名在游戏主包的翻译表里；抓一次缓存一天，抓不到就退回英文名。
   async function loadNames() {
     try {
       const cached = JSON.parse(localStorage.getItem(NAMES_KEY) || 'null');
       if (cached && Number.isFinite(cached.at) && Date.now() - cached.at < 864e5 && cached.items && typeof cached.items === 'object') {
-        names = cached.items; namesAt = cached.at; return;
+        names = cached.items; namesAt = cached.at;
       }
     } catch { /* 缓存坏了就重新拉 */ }
     try {
-      const response = await fetch('/api/market/prices.json', { credentials: 'omit', cache: 'no-cache' });
-      if (!response.ok) return;
-      const data = await response.json();
-      const items = {};
-      for (const [key, value] of Object.entries(data?.items || {})) {
-        if (!/^\d+$/.test(key) || !value || typeof value !== 'object') continue;
-        items[key] = { n: String(value.name || ''), r: String(value.rarity || '') };
+      const zh = JSON.parse(localStorage.getItem(ZH_KEY) || 'null');
+      if (zh && Number.isFinite(zh.at) && Date.now() - zh.at < 864e5 && zh.items && typeof zh.items === 'object') {
+        zhNames = zh.items;
+      } else {
+        const bundle = [...document.querySelectorAll('script[src*="/assets/"]')].map(node => node.src).find(src => /\.js(\?|$)/.test(src));
+        if (bundle) {
+          const response = await fetch(bundle, { credentials: 'omit', cache: 'force-cache' });
+          if (response.ok) {
+            const source = await response.text();
+            const items = {};
+            const pairs = [
+              /"([^"]{1,64})"\s*:\s*"([^"]{1,160})"/g,
+              /([A-Za-z][\w'’-][\w'’\- ]{0,62})\s*:\s*"([^"]{1,160})"/g
+            ];
+            for (const pattern of pairs) for (let match; (match = pattern.exec(source));) {
+              const key = match[1], value = match[2];
+              if (key && value && /[一-龥]/.test(value) && !items[key]) items[key] = value;
+            }
+            if (Object.keys(items).length > 100) {
+              zhNames = items;
+              try { localStorage.setItem(ZH_KEY, JSON.stringify({ at: Date.now(), items })); } catch { /* 存不下只影响显示 */ }
+            }
+          }
+        }
       }
-      if (!Object.keys(items).length) return;
-      names = items; namesAt = Date.now();
-      try { localStorage.setItem(NAMES_KEY, JSON.stringify({ at: namesAt, items })); } catch { /* 存不下只影响名字显示 */ }
-      paint();
-    } catch { /* 名字只是显示用，拉不到就显示编号 */ }
+    } catch { /* 中文名拿不到就显示英文名 */ }
+    if (!names || !namesAt) {
+      try {
+        const response = await fetch('/api/market/prices.json', { credentials: 'omit', cache: 'no-cache' });
+        if (response.ok) {
+          const data = await response.json();
+          const items = {};
+          for (const [key, value] of Object.entries(data?.items || {})) {
+            if (!/^\d+$/.test(key) || !value || typeof value !== 'object') continue;
+            items[key] = { n: String(value.name || ''), r: String(value.rarity || '') };
+          }
+          if (Object.keys(items).length) {
+            names = items; namesAt = Date.now();
+            try { localStorage.setItem(NAMES_KEY, JSON.stringify({ at: namesAt, items })); } catch { /* 忽略 */ }
+          }
+        }
+      } catch { /* 名字只是显示用 */ }
+    }
+    paint();
   }
   const host = document.createElement('div');
   host.id = 'dvi-autodrop';

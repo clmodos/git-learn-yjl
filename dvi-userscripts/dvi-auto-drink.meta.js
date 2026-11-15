@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         [DVI]自动喝药
 // @namespace    local.dvi.autodrink
-// @version      0.1.1
-// @description  药水剩余时间低于设定的阈值时，自动按指定品质与瓶数喝药；类型、阈值、品质、瓶数全部可自定义，读的是游戏自己的增益数据。
+// @version      0.2.1
+// @description  药水剩余时间低于阈值时自动补：背包有就地喝，只有仓库就走到仓库喝，仓库也没有就自动去市场买指定品质瓶数再喝。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*
 // @match        https://cn.deepveinidle.com/*
