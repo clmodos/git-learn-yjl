@@ -1,11 +1,11 @@
 {
   "base": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts",
-  "generatedAt": "2026-11-15T08:39:27.039Z",
+  "generatedAt": "2026-11-15T08:40:44.909Z",
   "scripts": [
     {
       "slug": "dvi-mastery-auto.all-in-one",
       "name": "[DVI]精通自动制造（内置精通助手 1.2.15）",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "description": "单文件版：内置 [DVI]精通助手 1.2.15 数据适配层（作者 SHIIN，CC-BY-ND），自动补料制造并统计金币与精通收益。",
       "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.user.js",
       "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.meta.js"
@@ -13,7 +13,7 @@
     {
       "slug": "dvi-auto-drop",
       "name": "[DVI]自动丢弃资源",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "description": "只丢掉背包里指定稀有度的资源（矿石、木材、鱼、金属锭、作物），装备、贵重品、药水、食物永不触碰；默认试运行。",
       "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drop.user.js",
       "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drop.meta.js"
@@ -21,7 +21,7 @@
     {
       "slug": "dvi-auto-drink",
       "name": "[DVI]自动喝药",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "description": "药水剩余时间低于阈值时自动补：背包有就地喝，只有仓库就走到仓库喝，仓库也没有就自动去市场买指定品质瓶数再喝。",
       "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drink.user.js",
       "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drink.meta.js"
@@ -29,7 +29,7 @@
     {
       "slug": "dvi-profit",
       "name": "[DVI] 捡漏 + 自动练级",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "description": "按“利润/小时”筛选采集与制造作业，一键自动挂机、补料、上架；另有快速升级tab，按金币/时间比值规划最省钱路线。",
       "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.user.js",
       "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.meta.js"
