@@ -1,0 +1,38 @@
+{
+  "base": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts",
+  "generatedAt": "2026-11-15T04:59:35.617Z",
+  "scripts": [
+    {
+      "slug": "dvi-mastery-auto",
+      "name": "[DVI]精通自动制造（精通助手伴随脚本）",
+      "version": "0.2.1",
+      "description": "配合精通助手 1.2.10 及以上（含 1.2.12），自动补料制造，统计金币和精通收益。",
+      "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.user.js",
+      "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.meta.js"
+    },
+    {
+      "slug": "dvi-mastery-auto.all-in-one",
+      "name": "[DVI]精通自动制造（内置精通助手 1.2.12）",
+      "version": "0.2.1",
+      "description": "单文件版：内置 [DVI]精通助手 1.2.12 数据适配层（作者 SHIIN，CC-BY-ND），自动补料制造并统计金币与精通收益。",
+      "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.user.js",
+      "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.meta.js"
+    },
+    {
+      "slug": "dvi-auto-drop",
+      "name": "[DVI]自动丢弃资源",
+      "version": "0.1.0",
+      "description": "只丢掉背包里指定稀有度的资源（矿石、木材、鱼、金属锭、作物），装备、贵重品、药水、食物永不触碰；默认试运行。",
+      "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drop.user.js",
+      "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drop.meta.js"
+    },
+    {
+      "slug": "dvi-auto-drink",
+      "name": "[DVI]自动喝药",
+      "version": "0.1.0",
+      "description": "药水剩余时间低于设定的阈值时，自动按指定品质与瓶数喝药；类型、阈值、品质、瓶数全部可自定义，读的是游戏自己的增益数据。",
+      "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drink.user.js",
+      "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drink.meta.js"
+    }
+  ]
+}

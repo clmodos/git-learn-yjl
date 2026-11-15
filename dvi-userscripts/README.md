@@ -1,0 +1,12 @@
+# DVI 用户脚本
+
+装一次，之后管理器会按 `@version` 自动检查更新（新版改这里、重新 publish 即可）。
+
+| 脚本 | 版本 | 安装 |
+| --- | --- | --- |
+| [DVI]精通自动制造（精通助手伴随脚本） | 0.2.1 | [安装](https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.user.js) |
+| [DVI]精通自动制造（内置精通助手 1.2.12） | 0.2.1 | [安装](https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.user.js) |
+| [DVI]自动丢弃资源 | 0.1.0 | [安装](https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drop.user.js) |
+| [DVI]自动喝药 | 0.1.0 | [安装](https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-auto-drink.user.js) |
+
+`.meta.js` 是给油猴管理器比对版本用的元数据，不要手动安装。
