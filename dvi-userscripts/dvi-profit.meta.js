@@ -2,7 +2,7 @@
 // @name         [DVI] 捡漏 + 自动练级
 // @name:zh-CN   [DVI] 捡漏 + 自动练级
 // @namespace    local.dvi.profit
-// @version      0.1.2
+// @version      0.1.3
 // @description  按“利润/小时”筛选采集与制造作业，一键自动挂机、补料、上架；另有快速升级tab，按金币/时间比值规划最省钱路线。
 // @description:en Pick gathering/crafting jobs by profit per hour, auto-run them, and plan the cheapest skill levelling route.
 // @author       clmodos

@@ -1,6 +1,6 @@
 {
   "base": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts",
-  "generatedAt": "2026-11-15T08:44:34.662Z",
+  "generatedAt": "2026-11-15T09:03:29.510Z",
   "scripts": [
     {
       "slug": "dvi-mastery-auto.all-in-one",
@@ -29,7 +29,7 @@
     {
       "slug": "dvi-profit",
       "name": "[DVI] 捡漏 + 自动练级",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "description": "按“利润/小时”筛选采集与制造作业，一键自动挂机、补料、上架；另有快速升级tab，按金币/时间比值规划最省钱路线。",
       "downloadURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.user.js",
       "updateURL": "https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.meta.js"

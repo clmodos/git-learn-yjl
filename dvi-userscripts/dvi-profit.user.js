@@ -2,7 +2,7 @@
 // @name         [DVI] 捡漏 + 自动练级
 // @name:zh-CN   [DVI] 捡漏 + 自动练级
 // @namespace    local.dvi.profit
-// @version      0.1.2
+// @version      0.1.3
 // @description  按“利润/小时”筛选采集与制造作业，一键自动挂机、补料、上架；另有快速升级tab，按金币/时间比值规划最省钱路线。
 // @description:en Pick gathering/crafting jobs by profit per hour, auto-run them, and plan the cheapest skill levelling route.
 // @author       clmodos
@@ -210,7 +210,8 @@ async function loadPrices(force = false) {
         buyQty: num(row.buyQty, 0),
         avg7d: num(row.avg7d, 0),
         vol7d: num(row.vol7d, 0),
-        avg30d: num(row.avg30d, 0)
+        avg30d: num(row.avg30d, 0),
+        vol30d: num(row.vol30d, 0)
       };
     }
     priceData = { at: now(), items, loading: false, error: null };
@@ -333,13 +334,15 @@ let VERSION_LOCAL = '0.0.0';
 /* ------------------------------ 设置 ------------------------------ */
 const DEFAULT_SETTINGS = {
   tab: 'profit',
-  minProfit: 50e6,          // 利润下限：50m/h
+  minProfit: 0,             // 利润下限（0 = 只要不亏就列）
   sellMode: 'instant',      // instant=吃买一，ask=压价挂单
+  sortMode: 'sustained',    // sustained=能卖掉的利润, theoretical=假设全卖掉, instant=现在就能吃的收单
   onlyUnlocked: true,
   includeCraft: true,
   includeGather: true,
   includeBonus: true,       // 额外掉落算进期望收益
-  minVolume: 0,             // 日销量下限过滤（0=不过滤）
+  minVolume: 0,             // 日成交量下限（0=不过滤）
+  absorbShare: 0.3,         // 我们最多吃掉某物品日成交量的这个比例
   autoBuy: true,            // 制造缺料自动买
   autoSell: true,           // 产物自动上架
   sellEvery: 20,            // 每 N 秒尝试卖一次
@@ -397,57 +400,121 @@ function actionsPerHour(job, level) {
   return TICKS_PER_HOUR / ticksPerAction(job, level);
 }
 
+/** 某物品的盘口与流动性（右侧收单优先，左侧卖单只作参考） */
+function liquidityOf(itemId) {
+  const row = priceOf(itemId);
+  if (!row) return null;
+  const dayVol = num(row.vol7d) / 7;
+  return {
+    bid: num(row.highestBuy),          // 右侧：最高收购价（立刻能成交的价）
+    bidQty: num(row.buyQty),           // 买盘挂单量：这一波能吃掉多少
+    ask: num(row.lowestSell),          // 左侧：卖一（挂单参考，不算价值）
+    askQty: num(row.sellQty),
+    avg: num(row.avg7d),
+    avg30: num(row.avg30d),
+    dayVol,                             // 7 日平均每天成交多少件
+    hourVol: dayVol / 24
+  };
+}
+
+/**
+ * 产出价值口径：右侧收单 > 7 日均价。左侧卖一不参与估值（挂上去未必成交）。
+ * @returns {{price:number, source:'bid'|'avg'|'none'}}
+ */
+function valuePriceOf(itemId) {
+  const liq = liquidityOf(itemId);
+  if (!liq) return { price: 0, source: 'none' };
+  if (liq.bid > 0) return { price: liq.bid, source: 'bid' };
+  if (liq.avg > 0) return { price: liq.avg, source: 'avg' };
+  return { price: 0, source: 'none' };
+}
+
 /**
  * 单个作业的经济模型。
- * @returns {{job, aph, xpPerHour, revenuePerHour, costPerHour, profitPerHour, revenuePerAction, costPerAction, profitPerAction, outQtyPerHour, sell, volPerDay, missing}}
+ * 关键点：挂机是持续产出，能卖出去的只有市场吸收得掉的那部分。
+ *  - 可持续利润：每秒产出 × 市场每小时能吸收的量，按右侧收单价（没有收单则用均价）计；
+ *  - 理论利润：假装货全卖掉（只作参考，标出来免得被假高利骗）。
+ * @returns {{job, aph, xpPerHour, revenuePerHour, costPerHour, profitPerHour, sustained, theoretical, instant, liquidity, ...}}
  */
 function jobEconomics(job, level, options = {}) {
-  const sellMode = options.sellMode || settings.sellMode;
   const includeBonus = options.includeBonus !== undefined ? options.includeBonus : settings.includeBonus;
+  const share = options.absorbShare !== undefined ? options.absorbShare : num(settings.absorbShare, 0.3);
   const aph = actionsPerHour(job, level);
+  const outQtyPerHour = job.outItem ? job.outQty * aph : 0;
 
-  let revenuePerAction = 0;
-  let sell = 0;
-  let outQtyPerHour = 0;
-  if (job.outItem === COIN_ITEM) {
-    // 偷窃摊位：直接给金币，没有税
-    revenuePerAction = job.outQty;
-    sell = 1;
-    outQtyPerHour = job.outQty * aph;
-  } else if (job.outItem) {
-    sell = sellPriceOf(job.outItem, sellMode);
-    revenuePerAction = job.outQty * sell * (1 - TAX_RATE);
-    outQtyPerHour = job.outQty * aph;
-  }
+  // 价值：收单优先，其次均价
+  const value = job.outItem === COIN_ITEM ? { price: 1, source: 'coin' } : valuePriceOf(job.outItem);
+  const liq = job.outItem === COIN_ITEM ? null : liquidityOf(job.outItem);
+
+  let bonusPerAction = 0;
   if (includeBonus && job.bonusItem && job.bonusChance > 0) {
-    revenuePerAction += job.bonusChance * sellPriceOf(job.bonusItem, sellMode) * (1 - TAX_RATE);
+    bonusPerAction = job.bonusChance * valuePriceOf(job.bonusItem).price * (1 - TAX_RATE);
   }
 
   let costPerAction = 0;
   const missing = [];
   for (const input of job.inputs) {
-    const price = buyPriceOf(input.itemId);
     if (!priceOf(input.itemId)) missing.push(input.itemId);
-    costPerAction += input.qty * price;
+    costPerAction += input.qty * buyPriceOf(input.itemId);
   }
 
-  const profitPerAction = revenuePerAction - costPerAction;
-  const profitPerHour = profitPerAction * aph;
-  const priceRow = priceOf(job.outItem);
+  // 市场每小时能吃下多少（我们只按成交量的 share 算，不假设吃满）
+  const absorbPerHour = liq ? liq.hourVol * Math.max(0, share) : Infinity;
+  // 每个动作产出的里，能卖掉多少
+  const sellablePerAction = job.outItem === COIN_ITEM
+    ? job.outQty
+    : Math.min(job.outQty, absorbPerHour / Math.max(1e-9, aph));
+  const stuckPerAction = job.outItem === COIN_ITEM ? 0 : Math.max(0, job.outQty - sellablePerAction);
+
+  const grossPerAction = job.outItem === COIN_ITEM
+    ? job.outQty
+    : sellablePerAction * value.price * (1 - TAX_RATE);
+  const sustainedPerAction = grossPerAction + bonusPerAction - costPerAction;
+  const theoreticalPerAction = (job.outItem === COIN_ITEM ? job.outQty : job.outQty * value.price * (1 - TAX_RATE)) + bonusPerAction - costPerAction;
+
+  // 一次性捡漏：现在就能按收单价吃掉的量（受买盘挂单量限制），并且要扣掉做这批货的材料钱
+  const instantQty = liq ? Math.min(liq.bidQty, outQtyPerHour) : 0;
+  const instantGross = (!liq || job.outItem === COIN_ITEM) ? 0 : instantQty * liq.bid * (1 - TAX_RATE);
+  const instantActions = job.outQty > 0 ? instantQty / job.outQty : 0;
+  const instantNet = instantGross - costPerAction * instantActions;
+
   return {
-    job, aph,
-    level,
+    job, aph, level,
     xpPerHour: job.xp * aph,
-    revenuePerAction, costPerAction, profitPerAction,
-    revenuePerHour: revenuePerAction * aph,
-    costPerHour: costPerAction * aph,
-    profitPerHour,
     outQtyPerHour,
-    sell,
-    volPerDay: priceRow ? priceRow.vol7d / 7 : null,
-    buyQty: priceRow ? priceRow.buyQty : null,
+    costPerAction,
+    costPerHour: costPerAction * aph,
+    revenuePerHour: grossPerAction * aph,
+    profitPerHour: sustainedPerAction * aph,     // 主排序口径：可持续
+    sustained: {
+      perAction: sustainedPerAction,
+      perHour: sustainedPerAction * aph,
+      sellablePerHour: sellablePerAction * aph,
+      stuckPerHour: stuckPerAction * aph
+    },
+    theoretical: {
+      perHour: theoreticalPerAction * aph
+    },
+    instant: { qty: instantQty, gross: instantGross, money: instantNet },
+    liquidity: liq,
+    value,
+    sell: value.price,
+    volPerDay: liq ? liq.dayVol : null,
+    buyQty: liq ? liq.bidQty : null,
     missing
   };
+}
+
+/** 列表用哪个口径排序/过滤 */
+function sortKeyOf(options = {}) {
+  return options.sortMode || settings.sortMode || 'sustained';
+}
+
+/** 按当前口径取“这个作业每小时值多少” */
+function metricOf(row, key) {
+  if (key === 'theoretical') return row.theoretical.perHour;
+  if (key === 'instant') return row.instant ? row.instant.money : 0;
+  return row.profitPerHour;
 }
 
 /** 捡漏列表：按利润/小时从高到低 */
@@ -457,6 +524,7 @@ function profitList(state, options = {}) {
   const includeCraft = options.includeCraft !== undefined ? options.includeCraft : settings.includeCraft;
   const includeGather = options.includeGather !== undefined ? options.includeGather : settings.includeGather;
   const minVolume = options.minVolume !== undefined ? options.minVolume : settings.minVolume;
+  const key = sortKeyOf(options);
   const rows = [];
   for (const job of JOBS) {
     if (!usableJob(job)) continue;
@@ -465,13 +533,13 @@ function profitList(state, options = {}) {
     if (onlyUnlocked && job.levelReq > level) continue;
     const econ = jobEconomics(job, level, options);
     if (minVolume > 0) {
-      const daily = econ.job.outItem === COIN_ITEM ? Infinity : (priceOf(job.outItem)?.vol7d || 0) / 7;
+      const daily = econ.job.outItem === COIN_ITEM ? Infinity : num(econ.volPerDay, 0);
       if (daily < minVolume) continue;
     }
-    if (econ.profitPerHour < minProfit) continue;
+    if (metricOf(econ, key) < minProfit) continue;
     rows.push(econ);
   }
-  rows.sort((a, b) => b.profitPerHour - a.profitPerHour);
+  rows.sort((a, b) => metricOf(b, key) - metricOf(a, key));
   return rows;
 }
 
@@ -654,13 +722,16 @@ async function sellItem(itemId, qty, epoch) {
   const before = stockOf(gameState(), itemId, true);
   const coinsBefore = coinsOf(gameState());
   const ordersBefore = ordersOf(gameState()).length;
-  const instant = sellPriceOf(itemId, 'instant');
-  const ask = sellPriceOf(itemId, 'ask');
-  // 买一价明显低于卖一（差价 <5%）时优先挂卖单，避免被低价吃掉
-  const row = priceOf(itemId);
-  const useInstant = row && row.highestBuy > 0 && row.highestBuy >= row.lowestSell * 0.95;
-  const price = itemId === COIN_ITEM ? 1 : (useInstant ? instant : ask);
-  send({ t: 'marketSell', itemId, qty, price });
+  const liq = liquidityOf(itemId);
+  // 右侧收单是真钱：收单价不低于均价 90% 就直接吃，吃不完的再压卖一挂单
+  const eatBid = !!liq && liq.bid > 0 && liq.bid >= liq.avg * 0.9;
+  const eatQty = eatBid ? Math.max(1, Math.min(qty, liq.bidQty)) : 0;
+  const restQty = Math.max(0, qty - eatQty);
+  const price = itemId === COIN_ITEM ? 1 : (eatBid ? liq.bid : sellPriceOf(itemId, 'ask'));
+  send({ t: 'marketSell', itemId, qty: eatBid ? eatQty : qty, price });
+  if (eatBid && restQty > 0) {
+    send({ t: 'marketSell', itemId, qty: restQty, price: sellPriceOf(itemId, 'ask') });
+  }
   const filled = await waitUntil(() => {
     const state = gameState();
     if (!state) return false;
@@ -828,7 +899,7 @@ async function runnerTick() {
   const econ = jobEconomics(job, current);
   runner.status = runner.mode === 'level'
     ? `练级中 ${skillZh(job.skill)} Lv${current} → ${runner.targetLevel}：${job.zh}`
-    : `捡漏中 ${job.zh}：${fmtGold(econ.profitPerHour)} 金币/小时`;
+    : `捡漏中 ${job.zh}：可卖 ${fmtGold(econ.profitPerHour)}/h（囤 ${fmtInt(econ.sustained.stuckPerHour)}/h，理论 ${fmtGold(econ.theoretical.perHour)}/h）`;
   if (typeof uiPainter === 'function') uiPainter();
 }
 
@@ -1114,20 +1185,30 @@ function buildProfitPane() {
       <label class="chk"><input type="checkbox" data-bonus> 算额外掉落</label>
       <label>速度修正 ×</label>
       <input type="number" data-speed min="0.2" max="3" step="0.05" style="width:64px">
+      <label>吃掉成交量</label>
+      <input type="number" data-share min="0" max="1" step="0.05" style="width:60px">
+      <label>日成交≥</label>
+      <input type="text" data-minvol style="width:64px">
+      <label>排序</label>
+      <select data-sort>
+        <option value="sustained">能卖掉的利润</option>
+        <option value="theoretical">理论利润（假设全卖）</option>
+        <option value="instant">现在就能吃的收单</option>
+      </select>
       <span style="flex:1"></span>
       <button class="act" data-refresh>刷新市场价</button>
     </div>
     <div class="row hint" data-price-note>市场价：等待加载…</div>
     <table>
-      <colgroup><col style="width:22%"><col style="width:10%"><col style="width:8%"><col style="width:12%"><col style="width:11%"><col style="width:14%"><col style="width:8%"><col style="width:9%"><col style="width:6%"></colgroup>
+      <colgroup><col style="width:21%"><col style="width:9%"><col style="width:7%"><col style="width:13%"><col style="width:10%"><col style="width:9%"><col style="width:11%"><col style="width:11%"><col style="width:9%"></colgroup>
       <thead><tr>
-        <th>作业</th><th>技能</th><th class="num">需等级</th>
-        <th class="num">利润/时</th><th class="num">成本/时</th><th class="num">产出/时</th>
-        <th class="num">单价</th><th class="num">日销量</th><th></th>
+        <th>作业</th><th>技能</th><th class="num">等级</th>
+        <th class="num">右侧收单</th><th class="num">均价</th><th class="num">日成交</th>
+        <th class="num">可卖/时</th><th class="num" data-metric-head>利润/时</th><th></th>
       </tr></thead>
       <tbody data-profit-rows></tbody>
     </table>
-    <div class="hint" data-profit-empty hidden>没有达到利润下限的项目：把下限调低，或关掉“只看已解锁”。</div>
+    <div class="hint" data-profit-empty hidden>没有达到利润下限的项目：把下限调低、关掉“只看已解锁”，或放宽“日成交≥”/“吃掉成交量”。利润按右侧收单价 × 市场能吸收的量算，卖不掉的货不算钱。</div>
   `;
   dom.minProfit = dom.paneProfit.querySelector('[data-min]');
   dom.onlyUnlocked = dom.paneProfit.querySelector('[data-only-unlocked]');
@@ -1135,6 +1216,9 @@ function buildProfitPane() {
   dom.craftChk = dom.paneProfit.querySelector('[data-craft]');
   dom.bonusChk = dom.paneProfit.querySelector('[data-bonus]');
   dom.speedInput = dom.paneProfit.querySelector('[data-speed]');
+  dom.shareInput = dom.paneProfit.querySelector('[data-share]');
+  dom.minVolInput = dom.paneProfit.querySelector('[data-minvol]');
+  dom.sortSel = dom.paneProfit.querySelector('[data-sort]');
   dom.refreshBtn = dom.paneProfit.querySelector('[data-refresh]');
   dom.profitRows = dom.paneProfit.querySelector('[data-profit-rows]');
   dom.profitEmpty = dom.paneProfit.querySelector('[data-profit-empty]');
@@ -1146,6 +1230,9 @@ function buildProfitPane() {
   dom.craftChk.checked = settings.includeCraft;
   dom.bonusChk.checked = settings.includeBonus;
   dom.speedInput.value = String(settings.speedAdj);
+  dom.shareInput.value = String(settings.absorbShare);
+  dom.minVolInput.value = settings.minVolume ? fmtInt(settings.minVolume) : '';
+  dom.sortSel.value = settings.sortMode;
 
   dom.minProfit.addEventListener('change', () => {
     settings.minProfit = parseGold(dom.minProfit.value, settings.minProfit);
@@ -1158,6 +1245,24 @@ function buildProfitPane() {
   dom.speedInput.addEventListener('change', () => {
     settings.speedAdj = clamp(num(Number(dom.speedInput.value), 1), 0.2, 3);
     dom.speedInput.value = String(settings.speedAdj);
+  dom.shareInput.value = String(settings.absorbShare);
+  dom.minVolInput.value = settings.minVolume ? fmtInt(settings.minVolume) : '';
+  dom.sortSel.value = settings.sortMode;
+    saveSettings(); renderProfit();
+  });
+  dom.shareInput.addEventListener('change', () => {
+    settings.absorbShare = clamp(num(Number(dom.shareInput.value), 0.3), 0, 1);
+    dom.shareInput.value = String(settings.absorbShare);
+    saveSettings(); renderProfit();
+  });
+  dom.minVolInput.addEventListener('change', () => {
+    settings.minVolume = Math.max(0, Math.round(parseGold(dom.minVolInput.value, 0)));
+    dom.minVolInput.value = settings.minVolume ? fmtInt(settings.minVolume) : '';
+  dom.sortSel.value = settings.sortMode;
+    saveSettings(); renderProfit();
+  });
+  dom.sortSel.addEventListener('change', () => {
+    settings.sortMode = dom.sortSel.value;
     saveSettings(); renderProfit();
   });
   dom.refreshBtn.addEventListener('click', async () => {
@@ -1190,7 +1295,7 @@ function renderProfit() {
   const base = priceData.error
     ? `市场价读取失败：${priceData.error}（用物品基础价值兜底）`
     : `市场价 ${stamp} 更新 · 共 ${Object.keys(priceData.items).length} 条 · 卖出：${settings.sellMode === 'instant' ? '吃买一' : '压价挂单'} · 税 2%`;
-  const note = `${base} · 速度修正 ×${settings.speedAdj}${calibrated ? ` · 已实测校准 ${calibrated} 个作业` : ' · 挂机满 2 分钟会自动实测校准'}`;
+  const note = `${base} · 速度修正 ×${settings.speedAdj} · 按日成交 ${Math.round(settings.absorbShare * 100)}% 估可卖量${calibrated ? ` · 已实测校准 ${calibrated} 个作业` : ' · 挂机满 2 分钟自动校准'}`;
   dom.priceNote.textContent = note;
 
   if (!rows.length) {
@@ -1203,22 +1308,38 @@ function renderProfit() {
   const html = rows.slice(0, 60).map(row => {
     const job = row.job;
     const locked = state ? job.levelReq > levelOf(state, job.skill) : false;
-    const vol = row.job.outItem === COIN_ITEM ? '金币' : (row.volPerDay === null ? '—' : fmtInt(row.volPerDay));
-    const priceLabel = job.outItem === COIN_ITEM ? '1' : fmtGold(row.sell);
-    const outPerHour = job.outItem === COIN_ITEM ? fmtGold(row.outQtyPerHour) : `${fmtInt(row.outQtyPerHour)} ${itemName(job.outItem)}`;
-    return `<tr class="${job.id === current ? 'pick' : ''}">
-      <td title="${escapeHtml(job.name)}">${escapeHtml(job.zh)}</td>
+    const liq = row.liquidity;
+    const isCoin = job.outItem === COIN_ITEM;
+    const bidCell = isCoin ? '<span class="dim">直接给钱</span>'
+      : liq && liq.bid > 0
+        ? `${fmtGold(liq.bid)}<span class="dim"> ×${fmtInt(liq.bidQty)}</span>${liq.avg > 0 && liq.bid >= liq.avg * 1.15 ? ' <span class="good">↑</span>' : ''}`
+        : '<span class="dim">无收单</span>';
+    const avgCell = isCoin ? '<span class="dim">—</span>' : (liq && liq.avg ? fmtGold(liq.avg) : '<span class="dim">—</span>');
+    const volCell = isCoin ? '<span class="dim">—</span>' : (row.volPerDay === null ? '<span class="dim">—</span>' : fmtInt(row.volPerDay));
+    const sellable = isCoin ? fmtGold(row.outQtyPerHour) : fmtInt(row.sustained.sellablePerHour);
+    const stuck = isCoin ? 0 : row.sustained.stuckPerHour;
+    const metric = metricOf(row, settings.sortMode);
+    const title = `产出 ${isCoin ? fmtGold(row.outQtyPerHour) : fmtInt(row.outQtyPerHour)}/h`
+      + ` · 成本 ${fmtGold(row.costPerHour)}/h`
+      + ` · 理论利润 ${fmtGold(row.theoretical.perHour)}/h（假设全卖掉）`
+      + ` · 现有收单能接 ${fmtInt(row.instant.qty)} 件，净赚 ${fmtGold(row.instant.money)}`
+      + (stuck > 0.5 ? ` · 每小时囤 ${fmtInt(stuck)} 件` : '')
+      + (row.value.source === 'avg' ? ' · 无收单，按 7 日均价估' : ' · 按右侧收单价估');
+    return `<tr class="${job.id === current ? 'pick' : ''}" title="${escapeHtml(title)}">
+      <td>${escapeHtml(job.zh)}</td>
       <td class="dim">${skillZh(job.skill)}</td>
       <td class="num ${locked ? 'bad' : ''}">${job.levelReq}</td>
-      <td class="num good">${fmtGold(row.profitPerHour)}</td>
-      <td class="num ${row.costPerHour > 0 ? 'warn' : 'dim'}">${row.costPerHour > 0 ? fmtGold(row.costPerHour) : '0'}</td>
-      <td class="num dim">${outPerHour}</td>
-      <td class="num dim">${priceLabel}</td>
-      <td class="num dim">${vol}</td>
+      <td class="num">${bidCell}</td>
+      <td class="num dim">${avgCell}</td>
+      <td class="num dim">${volCell}</td>
+      <td class="num ${row.sustained.sellablePerHour > 0 ? 'dim' : 'bad'}">${sellable}</td>
+      <td class="num ${metric > 0 ? 'good' : 'bad'}">${fmtGold(metric)}</td>
       <td><button class="act go" data-start="${job.id}" ${locked ? 'disabled' : ''}>${job.id === current ? '进行中' : '开始'}</button></td>
     </tr>`;
   }).join('');
   dom.profitRows.innerHTML = html;
+  const head = dom.paneProfit.querySelector('[data-metric-head]');
+  if (head) head.textContent = settings.sortMode === 'theoretical' ? '理论/时' : settings.sortMode === 'instant' ? '瞬时可吃' : '可卖利润/时';
 }
 
 /* ------------------------------ 升级面板 ------------------------------ */
@@ -1363,7 +1484,7 @@ function renderLevel() {
  * dvi-profit · main：引导、定时刷新、对外接口
  * ========================================================================= */
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.3';
 VERSION_LOCAL = VERSION;
 
 async function boot() {
