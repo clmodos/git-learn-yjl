@@ -2,7 +2,7 @@
 // @name         [DVI] 捡漏 + 自动练级
 // @name:zh-CN   [DVI] 捡漏 + 自动练级
 // @namespace    local.dvi.profit
-// @version      0.1.0
+// @version      0.1.1
 // @description  按“利润/小时”筛选采集与制造作业，一键自动挂机、补料、上架；另有快速升级tab，按金币/时间比值规划最省钱路线。
 // @description:en Pick gathering/crafting jobs by profit per hour, auto-run them, and plan the cheapest skill levelling route.
 // @author       clmodos
@@ -51,6 +51,12 @@ const PRICE_KEY = 'dvi.profit.prices.v1';
 const CALIB_KEY = 'dvi.profit.calib.v1';
 const PRICE_URL = 'https://deepveinidle.com/api/market/prices.json';
 const PRICE_TTL = 5 * 60 * 1000;     // 官方 5 分钟重建一次
+
+// 自动更新：油猴按头部的 @updateURL 自行比对；这里再做一层自检，方便看见/手动升级
+const UPDATE_META = 'https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.meta.js';
+const UPDATE_PAGE = 'https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-profit.user.js';
+const UPDATE_KEY = 'dvi.profit.update.v1';
+const UPDATE_TTL = 6 * 60 * 60 * 1000;
 
 /* ------------------------------ 小工具 ------------------------------ */
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -278,6 +284,51 @@ function send(message) {
   } catch { return false; }
   return false;
 }
+
+/* ---------------------------- 自检更新 ---------------------------- */
+const updateState = { latest: null, checkedAt: 0, failed: false };
+
+function versionParts(value) {
+  const parts = String(value ?? '').split('.').map(Number);
+  return parts.length && parts.every(Number.isSafeInteger) ? parts : null;
+}
+
+function isNewer(candidate, current) {
+  const a = versionParts(candidate), b = versionParts(current);
+  if (!a || !b) return false;
+  for (let index = 0; index < Math.max(a.length, b.length); index++) {
+    const left = a[index] ?? 0, right = b[index] ?? 0;
+    if (left !== right) return left > right;
+  }
+  return false;
+}
+
+async function checkUpdate(force = false) {
+  const cached = store.read(UPDATE_KEY, null);
+  if (!force && cached && now() - num(cached.at) < UPDATE_TTL) {
+    updateState.latest = cached.latest || null;
+    updateState.checkedAt = num(cached.at);
+    return updateState;
+  }
+  try {
+    const response = await fetch(UPDATE_META + '?t=' + now(), { cache: 'no-store' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const text = await response.text();
+    const match = /\/\/\s*@version\s+(\S+)/.exec(text);
+    const latest = match ? match[1] : null;
+    updateState.latest = latest;
+    updateState.checkedAt = now();
+    updateState.failed = !latest;
+    store.write(UPDATE_KEY, { at: updateState.checkedAt, latest });
+  } catch {
+    updateState.failed = true;
+    updateState.checkedAt = now();
+  }
+  return updateState;
+}
+
+const updateAvailable = () => !!(updateState.latest && isNewer(updateState.latest, VERSION_LOCAL));
+let VERSION_LOCAL = '0.0.0';
 
 /* ------------------------------ 设置 ------------------------------ */
 const DEFAULT_SETTINGS = {
@@ -930,6 +981,7 @@ function ensurePanel() {
       <span class="dot" data-dot></span>
       <b>DVI 捡漏 + 练级</b>
       <span class="grow"></span>
+      <button data-update hidden title="发现新版本，点这里安装">新版</button>
       <span class="dim" data-clock></span>
       <button data-collapse>收起</button>
     </div>
@@ -958,6 +1010,7 @@ function ensurePanel() {
     clock: shadow.querySelector('[data-clock]'),
     main: shadow.querySelector('[data-main]'),
     collapse: shadow.querySelector('[data-collapse]'),
+    updateBtn: shadow.querySelector('[data-update]'),
     tabProfit: shadow.querySelector('[data-tab="profit"]'),
     tabLevel: shadow.querySelector('[data-tab="level"]'),
     paneProfit: shadow.querySelector('[data-pane="profit"]'),
@@ -972,6 +1025,11 @@ function ensurePanel() {
   paintStatus = () => {
     if (!dom.status) return;
     dom.status.textContent = runner.status;
+    if (dom.updateBtn) {
+      const has = updateAvailable();
+      dom.updateBtn.hidden = !has;
+      if (has) dom.updateBtn.textContent = `新版 ${updateState.latest}`;
+    }
     dom.dot.classList.toggle('on', runner.running);
     dom.clock.textContent = isLive() ? '在线' : '离线';
     const logs = runner.history.slice(0, 6).map(line => `<div>${escapeHtml(line)}</div>`).join('');
@@ -1026,6 +1084,10 @@ function bindPanel() {
   dom.tabProfit.addEventListener('click', () => selectTab('profit'));
   dom.tabLevel.addEventListener('click', () => selectTab('level'));
   dom.pause.addEventListener('click', () => pauseRunner());
+  dom.updateBtn.addEventListener('click', () => {
+    // 直接打开脚本地址，油猴会弹安装/更新确认
+    window.open(UPDATE_PAGE, '_blank', 'noopener');
+  });
 }
 
 function selectTab(tab) {
@@ -1301,7 +1363,8 @@ function renderLevel() {
  * dvi-profit · main：引导、定时刷新、对外接口
  * ========================================================================= */
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
+VERSION_LOCAL = VERSION;
 
 async function boot() {
   if (window.__DVI_PROFIT__) return;
@@ -1310,6 +1373,7 @@ async function boot() {
 
   ensurePanel();
   await loadPrices(false);
+  checkUpdate(false).then(() => uiPainter());
   selectTab(settings.tab === 'level' ? 'level' : 'profit');
 
   // 每秒刷新状态条；表格内容按需重绘（避免打断输入）
@@ -1332,6 +1396,9 @@ async function boot() {
   // 市场价 5 分钟刷新一次
   setInterval(() => loadPrices(true), PRICE_TTL);
 
+  // 每 6 小时自检一次新版本（油猴自己也会按 @updateURL 检查）
+  setInterval(() => checkUpdate(true).then(() => uiPainter()), UPDATE_TTL);
+
   window.__DVI_PROFIT__ = {
     version: VERSION,
     ready: true,
@@ -1341,6 +1408,8 @@ async function boot() {
     plan: (skill, target, budget) => buildPlan(gameState(), skill, target, budget ?? budgetOf()),
     start: jobId => startProfit(Number(jobId)),
     startLevel: () => startLevel(),
+    checkUpdate: force => checkUpdate(force),
+    update: () => updateState,
     pause: () => pauseRunner(),
     runner,
     settings,
