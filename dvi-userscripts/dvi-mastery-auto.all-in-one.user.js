@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         [DVI]精通自动制造（内置精通助手 1.2.12）
+// @name         [DVI]精通自动制造（内置精通助手 1.2.15）
 // @namespace    local.dvi.mastery.automation
-// @version      0.2.2
-// @description  单文件版：内置 [DVI]精通助手 1.2.12 数据适配层（作者 SHIIN，CC-BY-ND），自动补料制造并统计金币与精通收益。
+// @version      0.2.3
+// @description  单文件版：内置 [DVI]精通助手 1.2.15 数据适配层（作者 SHIIN，CC-BY-ND），自动补料制造并统计金币与精通收益。
 // @match        https://deepveinidle.com/*
 // @match        https://www.deepveinidle.com/*
 // @match        https://cn.deepveinidle.com/*
@@ -15,11 +15,11 @@
 // @updateURL    https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.meta.js
 // @downloadURL  https://raw.githubusercontent.com/clmodos/git-learn-yjl/master/dvi-userscripts/dvi-mastery-auto.all-in-one.user.js
 // ==/UserScript==
-/* 内置部分：[DVI]精通助手 1.2.12（https://greasyfork.org/scripts/601366），作者 SHIIN，许可证 CC-BY-ND。 */
-/* 末段为本地自动制造层，版本 0.2.0。 */
+/* 内置部分：[DVI]精通助手 1.2.15（https://greasyfork.org/scripts/601366），作者 SHIIN，许可证 CC-BY-ND。 */
+/* 末段为本地自动制造层。 */
 (function () {
 "use strict";
-const PLUGIN_VERSION = '1.2.12';
+const PLUGIN_VERSION = '1.2.15';
 const module = { exports: {} };
 (function (root, factory) {
     'use strict';
@@ -387,7 +387,7 @@ const module = { exports: {} };
     }
     function nextMilestone(count, data = {}, itemId = 0) {
         if (!integer(count)) return null;
-        const rule = collectionRule(data), item = itemMap(data).get(itemId);
+        const rule = collectionRule(data);
         if (!Array.isArray(rule?.thresholds) || !rule.thresholds.length) return null;
         const thresholds = collectionThresholds(itemId,data);
         const index = thresholds.findIndex(n => n > count);
@@ -692,7 +692,7 @@ const module = { exports: {} };
             const gap = rule ? rule.safeAtLevel-job.levelReq : 0;
             return gap > 0 ? Math.max(0,Math.min(1,rule.chanceAtReq*(1-((skillLevel || job.levelReq)-job.levelReq)/gap)*handsMultiplier)) : 0;
         };
-        const caughtChance = failureAt(job.caught), failureChance = (1-caughtChance)*(1-failureAt(job.burn));
+        const caughtChance = failureAt(job.caught), burnChance = failureAt(job.burn), failureChance = (1-caughtChance)*(1-burnChance);
         let exportedMultiplier = character.speedBonus?.[job.skill]?.multiplier;
         let upgradeSpeedKnown = true;
         if (upgrade && data.rules.workTiming.offhandEnabled) {
@@ -706,7 +706,7 @@ const module = { exports: {} };
         const tickSeconds = data.rules.tickMs/1000, baseTicks = number(job.baseTicks);
         const baseActionSeconds = !job.grow && baseTicks > 0 ? baseTicks*tickSeconds : null;
         const actionSeconds = baseActionSeconds === null || upgrade && !upgradeSpeedKnown ? null : (upgrade ? Math.max(1,Math.round(baseTicks/speed)) : Math.max(1,baseTicks/speed))*tickSeconds;
-        const context = {skill,skillLevel,failureChance,exportedMultiplier,hasSpeedBonus,speed,tickSeconds,baseActionSeconds,actionSeconds,stunSeconds:caughtChance*Math.max(0,number(job.caught?.stunTicks)-1)*tickSeconds,qualityMultiplier:character.qualityMultipliers?.[job.skill] ?? 1,luck:character.luckBonus?.[job.skill]?.bonus ?? character.luckBonus?.elsewhere?.bonus ?? 0};
+        const context = {skill,skillLevel,failureChance,burnChance,caughtChance,exportedMultiplier,hasSpeedBonus,speed,tickSeconds,baseActionSeconds,actionSeconds,stunSeconds:caughtChance*Math.max(0,number(job.caught?.stunTicks)-1)*tickSeconds,qualityMultiplier:character.qualityMultipliers?.[job.skill] ?? 1,luck:character.luckBonus?.[job.skill]?.bonus ?? character.luckBonus?.elsewhere?.bonus ?? 0};
         character.workContexts?.set(job.id,context);
         return context;
     }
@@ -778,11 +778,13 @@ const module = { exports: {} };
         if (chance >= 1) return 1;
         return regularizedBeta(chance,required,trials-required+1);
     }
-    function rankingSeconds(task) {
+    function rankingSeconds(task, factors = null) {
         const seconds = task.expectedSeconds ?? task.seconds;
         if (!Number.isFinite(seconds) || seconds < 0) return null;
         const successes = task.minimumBatches, mean = task.expectedActions;
         if (task.kind === 'forge' || task.kind === 'farm' || !Number.isSafeInteger(successes) || successes < 1 || !Number.isFinite(mean) || mean <= successes) return seconds;
+        const key = factors && `${successes}:${mean}`, cached = factors?.get(key);
+        if (cached !== undefined) { const estimate = seconds*cached; return Number.isFinite(estimate) ? estimate : seconds; }
         const chance = successes/mean;
         let lower = successes, upper = Math.ceil(mean);
         if (!Number.isSafeInteger(upper)) return seconds;
@@ -801,7 +803,8 @@ const module = { exports: {} };
                 else lower = middle+1;
             }
         }
-        const estimate = seconds*Math.max(1,upper/mean);
+        const factor = Math.max(1,upper/mean), estimate = seconds*factor;
+        factors?.set(key,factor);
         return Number.isFinite(estimate) ? estimate : seconds;
     }
     function jointThresholdEstimate(successes,targetChance,companionChance,required,jointChance=0) {
@@ -836,16 +839,18 @@ const module = { exports: {} };
     const jointThresholdChance = (...args) => jointThresholdEstimate(...args).probability;
     function* collectionBenefitSteps(tasks, character, data) {
         const actions = new Map(), rule = collectionRule(data), items = itemMap(data), jobs = jobMap(data).map;
+        const rankingFactors = new Map();
+        const wanted = new Set(tasks.filter(task=>['gather','combat'].includes(task.kind) && task.outputChance > 0 && integer(task.minimumBatches,1)).map(task=>task.kind === 'combat' ? `combat:${task.monsterId}` : `job:${task.jobId}`));
         for (const source of data.collectionSources || []) {
+            const combat = source.kind === 'combat', key = combat ? `combat:${source.monsterId}` : `job:${source.jobId}`;
+            if (!wanted.has(key)) continue;
             if (!taskAvailable(source,data,character)) continue;
             const item = items.get(source.itemId), job = jobs.get(source.jobId);
             if (!item || item.pet || source.pet || source.retired || job?.retired || source.qty !== 1 || rule.excludedItemIds.includes(item.id)) continue;
-            const combat = source.kind === 'combat';
             if (!combat && (source.kind !== 'job' || !job || job.inputs.length || job.grow)) continue;
             const context = combat ? null : workContext(job,character,data);
             const multiplier = source.chanceMode === 'combatLuck' ? character.combatLuckMultiplier : 1;
             if (!(multiplier > 0) || !Number.isFinite(multiplier)) continue;
-            const key = combat ? `combat:${source.monsterId}` : `job:${source.jobId}`;
             if (!actions.has(key)) actions.set(key,[]);
             for (let rarity = 0; rarity < (item.rarityable ? rarityCount(data) : 1); rarity++) {
                 const quality = sourceQualityProbability(source,rarity,combat ? character.luckBonus?.elsewhere?.bonus || 0 : context.luck,item,data,combat ? character.qualityMultipliers?.combat ?? 1 : context.qualityMultiplier);
@@ -860,7 +865,7 @@ const module = { exports: {} };
             if (++processed % 32 === 0) yield;
             task.rankingGain = task.gain;
             if (task.kind === 'forge') continue;
-            task.rankingSeconds = rankingSeconds(task);
+            task.rankingSeconds = rankingSeconds(task,rankingFactors);
             const benefits = [];
             const thresholds=collectionThresholds(task.baseItemId,data);
             for (let index = 0; index < thresholds.length; index++) {
@@ -889,7 +894,7 @@ const module = { exports: {} };
         const next = nextMilestone(current,data,baseItemId);
         if (!next || !integer(job.output.qty,1)) return null;
         const basicGather = !source && !upgrade && !job.grow && job.inputs.length === 0 && data.skillGroups.gather.includes(job.skill);
-        const {skill,skillLevel,failureChance,exportedMultiplier,hasSpeedBonus,speed,tickSeconds,baseActionSeconds,actionSeconds,stunSeconds,luck,qualityMultiplier} = workContext(job,character,data,upgrade);
+        const {skill,skillLevel,failureChance,burnChance,caughtChance,exportedMultiplier,hasSpeedBonus,tickSeconds,baseActionSeconds,actionSeconds,stunSeconds,luck,qualityMultiplier} = workContext(job,character,data,upgrade);
         const sourceQuality = source ? sourceQualityProbability(source,rarity,luck,item,data,qualityMultiplier) : null;
         if (source && (!(source.chance > 0 && source.chance <= 1) || !Number.isFinite(source.chance) || !(sourceQuality > 0))) return null;
         const sourceChance = source ? Math.min(1,source.chance * sourceQuality) : 1;
@@ -907,21 +912,25 @@ const module = { exports: {} };
         const locked = skillLevel === null || skillLevel < job.levelReq;
         const randomOutput = source ? sourceChance < 1 || source.quality === 'random' && !!item.rarityable : job.fixedOutputRarity === undefined && inputs.length === 0 && !!item.rarityable;
         const uncertainAttempts = randomOutput || failurePossible;
+        const countedCraft = !upgrade && !job.grow && inputs.length > 0;
+        const burnLossExcluded = countedCraft && [3,4].includes(rarity) && (!source || source.sourceType === 'output') && burnChance > 0;
+        const planningSuccessChance = burnLossExcluded ? 1-caughtChance : failureChance;
         const outputChance = source ? sourceChance : randomOutput ? qualityProbability(rarity,luck,data,qualityMultiplier) : 1;
         // Input-saving tools only waive consumption; the full recipe remains a safe material ceiling.
         const materialsConservative = !upgrade && conservativeWorkMaterials(job,character,data);
         const reservations = character.reservations;
         const selfOrder = !source && !upgrade && inputs.length && character.completeness?.workOrders !== false && !reservations.ambiguousJobs.has(job.id) ? reservations.selfOrders.get(`${job.id}:${productionRarity}`) : null;
-        const rule = collectionRule(data), farmBase = job.grow && source ? farmEstimate(1,skillLevel,job,character,data) : null;
+        const farmBase = job.grow && source ? farmEstimate(1,skillLevel,job,character,data) : null;
         const build = milestone => {
             const bulk = milestone.target > next.target;
             const farm = job.grow ? source ? (()=>{
                 const harvests = Math.ceil(milestone.remaining/job.output.qty)/sourceChance;
                 return {...farmBase,harvests,batches:Math.ceil(harvests),seconds:harvests*(farmBase.growthSeconds+2*data.rules.tickMs/1000),meanYield:job.output.qty*sourceChance};
             })() : farmEstimate(milestone.remaining,skillLevel,job,character,data) : null;
-            const minimumBatches = farm ? farm.batches : Math.ceil(milestone.remaining / job.output.qty), batches = minimumBatches;
-            const expectedActions = farm ? farm.harvests : outputChance > 0 && failureChance > 0 ? minimumBatches / outputChance / failureChance : null;
+            const minimumBatches = farm ? farm.batches : Math.ceil(milestone.remaining / job.output.qty);
+            const expectedActions = farm ? farm.harvests : outputChance > 0 && planningSuccessChance > 0 ? minimumBatches / outputChance / planningSuccessChance : null;
             const estimatedBatches = expectedActions === null ? null : Math.ceil(expectedActions);
+            const batches = countedCraft ? estimatedBatches : minimumBatches;
             const materials = estimatedBatches === null ? null : materialsFor(inputs, estimatedBatches, character, data, selfOrder);
             if (!materials) return null;
             let expectedSeconds = !farm && actionSeconds === null || expectedActions === null ? null : farm ? farm.seconds : expectedActions * (actionSeconds+stunSeconds);
@@ -939,9 +948,10 @@ const module = { exports: {} };
                 title: `${(data.rules.rarityNamesZh || [])[rarity] || ''}${item.nameZh || item.name} · 自产累计 ${milestone.target}`,
                 itemId, baseItemId, rarity, current, target: milestone.target, remaining: milestone.remaining, gain,
                 jobId: upgrade ? upgrade.job || null : job.id, skill: job.skill, levelReq: job.levelReq, locked, productionRarity,
-                materials, batches, minimumBatches, expectedActions, estimatedBatches, materialsEstimated:!!farm || uncertainAttempts || materialsConservative, ...(materialsConservative ? {materialsConservative:true} : {}), bulk, uncertainAttempts, stopMode:basicGather || uncertainAttempts ? 'endless' : 'count', seconds, expectedSeconds, actionSeconds, baseActionSeconds, speedMultiplier:farm ? null : hasSpeedBonus ? exportedMultiplier : null, outputChance, ...(farm ? {farmHarvests:farm.harvests,farmMeanYield:farm.meanYield,farmGrowthSeconds:farm.growthSeconds,farmCycleSeconds:farm.growthSeconds+2*tickSeconds} : {}), secondsConservative:!!farm?.conservative,secondsBaseline:farm ? character.timing?.farmGrowthMultiplier == null || !own(character.equipment || {},'hoe') : !hasSpeedBonus || failurePossible && character.timing?.hands == null || randomOutput && (!character.completeness?.qualityModifiers || !character.completeness?.luckBonus), secondsEstimated: true, cost, costKnown: cost !== null, costEstimated: true, materialCost, materialCostPerPoint:materialCost === null ? null : materialCost / Math.max(1,gain), coinCost: 0,
+                materials, batches, minimumBatches, expectedActions, estimatedBatches, materialsEstimated:!!farm || uncertainAttempts || materialsConservative, ...(materialsConservative ? {materialsConservative:true} : {}), bulk, uncertainAttempts, burnChance, caughtChance, stopMode:countedCraft ? 'count' : basicGather || uncertainAttempts ? 'endless' : 'count', seconds, expectedSeconds, actionSeconds, baseActionSeconds, speedMultiplier:farm ? null : hasSpeedBonus ? exportedMultiplier : null, outputChance, ...(farm ? {farmHarvests:farm.harvests,farmMeanYield:farm.meanYield,farmGrowthSeconds:farm.growthSeconds,farmCycleSeconds:farm.growthSeconds+2*tickSeconds} : {}), secondsConservative:!!farm?.conservative,secondsBaseline:farm ? character.timing?.farmGrowthMultiplier == null || !own(character.equipment || {},'hoe') : !hasSpeedBonus || failurePossible && character.timing?.hands == null || randomOutput && (!character.completeness?.qualityModifiers || !character.completeness?.luckBonus), secondsEstimated: true, cost, costKnown: cost !== null, costEstimated: true, materialCost, materialCostPerPoint:materialCost === null ? null : materialCost / Math.max(1,gain), coinCost: 0,
                 randomOutput, progress: Math.min(1, current / milestone.target)
             };
+            if (burnLossExcluded) task.burnLossExcluded = true;
             if (source) Object.assign(task,{sourceId:source.id,sourceType:source.sourceType,sourceKind:'job',sourceJobId:job.id,actionName:job.nameZh || job.name});
             const work = !upgrade && character.scheduledWork?.get(job.id);
             const scheduled = work && (inputs.length === 0 ? work.all : work.rarities.get(rarity));
@@ -1027,22 +1037,6 @@ const module = { exports: {} };
             if (target <= current) continue;
             collect(target === next.target ? task : build({target,remaining:target-current}));
         }
-        return task;
-    }
-    function makeManualCollectionTask(source, character, data, options) {
-        const item = itemMap(data).get(source.itemId);
-        if (!item?.pet || data.rules.collection.excludedItemIds.includes(item.id)) return null;
-        const itemId = encodeItem(item.id,0,0,data), current = character.collections[itemId] || 0;
-        if (!nextMilestone(current,data,item.id)) return null;
-        const task = {
-            id:`collection:${itemId}:1:${source.id}`,kind:'enhance',skill:source.skill || 'enhancing',title:`${item.nameZh || item.name} · 首次自产`,
-            itemId,baseItemId:item.id,rarity:0,current,target:1,remaining:1,gain:data.rules.collection.petFirst,
-            sourceId:source.id,sourceKind:source.kind,sourceType:source.sourceType,actionName:'强化尝试',jobId:null,levelReq:0,locked:false,
-            materials:[],batches:1,minimumBatches:1,bulk:false,stopMode:'endless',seconds:null,expectedSeconds:null,actionSeconds:null,
-            outputChance:source.chance,randomOutput:true,uncertainAttempts:true,cost:null,costKnown:false,costEstimated:true,materialCost:null,materialCostPerPoint:null,coinCost:0,
-            queued:false,relatedWork:false,manual:true,routeUnsupported:true,progress:0
-        };
-        task.difficulty = rankTask(task,options);
         return task;
     }
     function* makeForgeTaskSteps(character, data, options) {
@@ -1195,7 +1189,7 @@ const module = { exports: {} };
             if (!expanded) add(task);
         };
         for (const job of data.jobs) {
-            if (job.retired || !featureAvailable(data,job.grow ? 'farming' : 'work')) continue;
+            if (job.retired || sourceSkills && !sourceSkills.has(job.skill) || !featureAvailable(data,job.grow ? 'farming' : 'work')) continue;
             const qualities = items.get(job.output.itemId)?.rarityable ? rarityCount(data) : 1;
             for (let rarity = 0; rarity < qualities; rarity++) pushCollection(job,rarity);
             yield;
@@ -1206,16 +1200,17 @@ const module = { exports: {} };
             if (source.kind === 'upgrade') {
                 const upgrade = upgrades.get(source.upgradeId);
                 if (!upgrade || source.itemId !== upgrade.id || source.skill !== upgrade.skill || source.qty !== 1 || source.chance !== 1 || source.sourceType !== 'output') continue;
+                if (sourceSkills && !sourceSkills.has(upgrade.skill)) continue;
                 const job = {id:-upgrade.recipe,skill:upgrade.skill,levelReq:upgrade.make,baseTicks:upgrade.baseTicks,inputs:[],output:{itemId:upgrade.id,qty:1}};
                 const qualities = items.get(upgrade.id)?.rarityable ? rarityCount(data) : 1;
                 for (let rarity = 0; rarity < qualities; rarity++) pushCollection(job,rarity,upgrade,source);
                 yield;
                 continue;
             }
-            if (source.kind === 'enhance') { push(makeManualCollectionTask(source,character,data,options)); continue; }
             if (source.kind === 'job' && (source.sourceType === 'output' || source.sourceType === 'primary')) continue;
             const job = source.kind === 'job' && jobs.get(source.jobId), monster = source.kind === 'combat' && monsters.get(source.monsterId);
             if (!job && !monster || job?.retired) continue;
+            if (sourceSkills && !sourceSkills.has(job ? job.skill : 'combat')) continue;
             const work = job && {...job,output:{itemId:source.itemId,qty:source.qty}};
             const first = source.quality === 'fixed' ? source.rarity ?? 0 : source.qualityFloor ?? 0;
             const last = source.quality === 'fixed' || !items.get(source.itemId)?.rarityable ? first : rarityCount(data)-1;
@@ -1258,14 +1253,10 @@ const module = { exports: {} };
                 const heads = groups.filter(group=>group.length).map(group=>group.reduce((a,b)=>compareSources(a,b)<=0 ? a : b));
                 chosen = [heads.reduce((a,b)=>compareSourceTime(a,b) <= 0 ? a : b)];
             }
-            const alternatives = sources.length > 1 ? sources.map(row=>({id:row.id,sourceId:row.sourceId ?? null,sourceType:row.sourceType ?? 'output',kind:row.kind,jobId:row.jobId,monsterId:row.monsterId ?? null,zoneIds:row.zoneIds ?? [],actionName:row.actionName ?? jobs.get(row.jobId)?.nameZh ?? jobs.get(row.jobId)?.name,expectedSeconds:row.expectedSeconds,cost:row.cost,locked:row.locked,queued:row.queued,relatedWork:row.relatedWork})) : null;
-            for (const task of chosen) {
-                if (alternatives) task.sourceAlternatives = alternatives;
-            }
             tasks.push(...chosen);
             if (++processed % 128 === 0) yield;
         }
-        if (options.includeForge !== false) tasks.push(...(yield* makeForgeTaskSteps(character, data, options)).filter(included));
+        if (options.includeForge !== false && (!sourceSkills || sourceSkills.has('enhancing'))) tasks.push(...(yield* makeForgeTaskSteps(character, data, options)).filter(included));
         yield;
         yield* collectionBenefitSteps(tasks,character,data);
         for (const task of tasks) { task.difficulty = rankTask(task,options); if (++processed % 128 === 0) yield; }
@@ -1986,16 +1977,7 @@ const work=schema.R9, at=work.shape.split(' ').indexOf('@15');
 work.strict=true;
 work.numbers=[0,1,0,0,0,1,1,0,0,0,0,1,0,0,1,1,0,0,1,1];
 work.variants=[{...work,shape:work.shape.replace('$21 = @15 (','$21 = $2 . plain ? # : @15 ('),refs:work.refs.map(([position,role])=>[position>=at?position+6:position,role]),numbers:[0,1,0,0,0,1,1,0,0,0,0,0,1,0,0,1,1,0,0,1,1]}];
-    const tables={
-        yz:['itemId','slot','accuracy','strength','defence','levelReq','needs'],
-        oH:['itemId','slot','bonus'],je:['id','name','bonus','feeds','look','blurb'],
-        wt:['id','name','level','hp','maxHit','attack','defence','speed','xp','gold','bonus','drop'],
-        T6:['id','name','monsterId','population'],h4:['itemId','skill','art'],On:['id','perRank','unit','lane']
-    };
-    for(const [role,fields]of Object.entries(tables))schema[role].table=fields;
-    schema.yz.tableRefs=[[110,'speed','Xa'],[140,'speed','Xi'],[146,'speed','xl'],[152,'speed','_i']];
     schema.fF.variants=[{"kind":"function","shape":"$0 , $1 , $2 , $3 , $4 , $5 , $6 = ! # { const $7 = @0 ( $3 . seedItemId ) ; if ( ! $7 ) return ; $0 . actionIndex ++ ; const $8 = @1 ( $0 , \"farm\" ) , $9 = $7 . inputs [ # ] ?. qty ?? # , $10 = @2 ( $3 . seedItemId ) ; if ( @3 ( $1 . seed , $1 . secretAt , @4 , $0 . id , $8 , $4 ) === null ) { for ( let $11 = # ; $11 < $9 ; $11 ++ ) @5 ( $0 , $6 ? $3 . seedItemId : $10 , # ) ; const $12 = @6 ( $3 , Object . keys ( $0 . plots ) . length , $4 , $7 . grow ?? # ) ; @7 ( $0 , $1 , $12 , $5 ) , @8 ( $0 , $1 , $12 , $5 ) ; return } const $13 = @9 ( $1 . windows , $4 ) , $14 = @3 ( $1 . seed , $1 . secretAt , @10 , $0 . id , $8 , $4 ) ?? # , $15 = @11 ( $0 , $1 , $2 , $3 , $4 ) , $16 = @12 ( @13 ( $3 , $4 ) , $15 ) , $17 = @14 ( @15 ( $0 . skills . farming ) ) + @16 ( @17 ( $0 . equipment . hoe ) , $14 ) , $18 = $17 * $16 , $19 = $17 * Math . max ( # , $16 - # ) , $20 = Math . max ( # , Math . min ( # , @18 ( $3 . seedItemId ) ) ) , $21 = @19 ( $7 . output . itemId , $20 ) ; for ( let $22 = # ; $22 < $18 ; $22 ++ ) @5 ( $0 , $21 , # ) ; const $23 = @20 ( $13 . rarityMult , @21 ( $0 ) , @22 ( $4 , \"farming\" , $1 . hypothetical ) , @23 ( $0 . masteries , \"rare\" ) ) ; for ( let $24 = # ; $24 < $9 ; $24 ++ ) { if ( $6 && $16 === # ) { @5 ( $0 , $3 . seedItemId , # ) ; continue } const $25 = @3 ( $1 . seed , $1 . secretAt , @24 , $0 . id , $8 * @25 + $24 , $4 ) , $26 = @26 ( $25 , @27 ( $0 . equipment ) + ( $0 . equipment . hoe === null ? # : @28 ( $0 . equipment . hoe ) ) , @20 ( $23 , @29 ( $0 ) ) ) ; @5 ( $0 , $26 === # ? $10 : @19 ( $10 , $26 ) , # ) } if ( $16 === # ) $5 . push ( { kind : \"harvestLost\" , itemId : $7 . output . itemId } ) ; else { const $27 = Math . round ( $7 . xp * @30 [ $20 ] * @20 ( $13 . xpMult , @31 ( $0 , ! # , \"farming\" ) , @32 ( $4 , \"farming\" , $1 . hypothetical ) , @23 ( $0 . masteries , \"xp\" ) ) ) , $28 = @33 ( $0 , \"farming\" , $27 ) ; $5 . push ( { kind : \"produced\" , jobId : $7 . id , itemId : $21 , xp : $27 , tier : $20 , qty : $18 , wire : ! # , xpBonus : $27 , ... $19 ? { overgrowth : $19 } : { } } ) , $28 . after > $28 . before && $5 . push ( { kind : \"levelUp\" , skill : \"farming\" , level : $28 . after } ) } const $29 = @6 ( $3 , Object . keys ( $0 . plots ) . length , $4 , $7 . grow ?? # ) ; @7 ( $0 , $1 , $29 , $5 ) , @8 ( $0 , $1 , $29 , $5 ) , @34 ( $0 , $1 , \"farming\" , $8 , $4 , $5 , @35 ( $7 . grow ?? # , $4 - $3 . plantedAt ) ) }","refs":[[20,"yt"],[42,"Kh"],[64,"go"],[73,"aa"],[83,"farmEntrySeed"],[111,"$a"],[129,"oA"],[153,"Hv"],[164,"bv"],[180,"Un"],[191,"aa"],[201,"farmYieldSeed"],[216,"farmGrowthRoll"],[231,"gP"],[233,"iG"],[245,"farmBaseYield"],[247,"$o"],[257,"farmToolYield"],[259,"Zl"],[306,"jo"],[317,"Pc"],[342,"$a"],[354,"pa"],[360,"Jw"],[365,"Bb"],[376,"ga"],[410,"$a"],[426,"aa"],[436,"farmRaritySeed"],[444,"farmSeedStride"],[453,"vm"],[457,"_l"],[475,"I1"],[485,"pa"],[489,"Um"],[496,"$a"],[506,"Pc"],[554,"ri"],[559,"pa"],[565,"lG"],[575,"FO"],[586,"ga"],[599,"vt"],[694,"oA"],[718,"Hv"],[729,"bv"],[740,"E4"],[754,"farmPetChance"]],"links":[],"locals":["c","o","plotId","e","a","t","s","d","n","l","i","R","J","r","f","u","m","g","v","p","w","G","J","k","J","R","F","J","R","A"],"strict":true,"numbers":[1,0,1,0,1,0,1,0,1,0,4,0,1,0,0,1,0,0,1,0,0,0,0,0]}];
-    schema.tT.variants=[{"kind":"function","shape":"$0 , $1 , $2 { const $3 = @0 ( $1 , $2 ) ; if ( $3 === null ) return \"notFrom\" ; if ( @1 ( $0 . skills [ $1 . skill ] ) < $1 . levelReq ) return \"level\" ; if ( @2 ( $0 , $2 ) < # ) return \"missing\" ; const $4 = @3 ( $0 , $1 , $2 ) ; if ( $4 === \"missing\" ) return \"missing\" ; const $5 = new Map , $6 = ( $7 , $8 ) => $5 . set ( $7 , ( $5 . get ( $7 ) ?? # ) + $8 ) ; $6 ( $2 , - # ) ; for ( const $9 of $4 ) $6 ( $9 . itemId , - $9 . qty ) ; $6 ( $3 , # ) ; let $10 = # ; for ( const [ $11 , $12 ] of $5 ) { const $13 = @2 ( $0 , $11 ) , $14 = $13 + $12 ; $13 > # && $14 === # && $10 -- , $13 === # && $14 > # && $10 ++ } if ( $10 > # && @4 ( $0 ) + $10 > @5 ( $0 ) && ! @6 ( $0 ) ) return \"full\" ; for ( const [ $15 , $16 ] of $5 ) { const $17 = @2 ( $0 , $15 ) + $16 ; $17 === # ? delete $0 . bank [ $15 ] : $0 . bank [ $15 ] = $17 } return @7 ( $0 , $1 . skill , $1 . xp ) , @8 ( $0 , $1 , $3 ) , \"ok\" }","refs":[[9,"upgradeTarget"],[27,"$o"],[48,"Po"],[63,"upgradeMaterials"],[169,"Po"],[210,"G2"],[217,"Sf"],[223,"Yn"],[246,"Po"],[277,"vt"],[290,"recordUpgrade"]],"links":[],"locals":["c","o","e","a","t","s","d","i","h","i","l","i","h","r","m","i","h","r"],"strict":true,"numbers":[1,0,1,1,0,0,0,0,0,0,0]}];
     schema.farmGrowthRoll={"kind":"function","shape":"$0 , $1 , $2 , $3 , $4 { return @0 ( $1 . seed , $1 . secretAt , @1 , $0 . id , @2 ( $2 , $3 . plantedAt , @1 ) , $4 ) }","refs":[[11,"aa"],[21,"farmGrowthSeed"],[27,"ic"],[35,"farmGrowthSeed"]],"links":[],"locals":["c","o","e","a","t"],"strict":true,"numbers":[]};
     // Reviewed source templates are parsed, never executed, to recognize renamed game functions.
     const modern=indexTopLevel(`
@@ -2121,9 +2103,9 @@ const collectionRarityFloors=new Map(collectionCurrencySources.map(c=>[c.shard,2
     schema.oH.staticMaps=true;
     schema.Az.staticMaps=true;
     schema.yz.fields=['itemId','slot','luck','offhand'];
-    delete schema.yz.tableRefs;
     schema.fireworks.shape='';
-    for(const role of ['R9','fF','Mq','II','_D','XD']){
+    const projectedRoles=new Set(['R9','fF','Mq','II','_D','XD']);
+    for(const role of projectedRoles){
         const rules=[schema[role],...(schema[role].variants||[])].map(rule=>projectRuntimeRule(rule,role));
         schema[role]={...rules[0],...rules.length>1?{variants:rules.slice(1)}:{}};
     }
@@ -2143,7 +2125,7 @@ const collectionRarityFloors=new Map(collectionCurrencySources.map(c=>[c.shard,2
     roots.forEach(visit);
     schema.farmYieldThresholds.strict=false;
     schema.II.strict=true;
-    for(const [role,expected]of Object.entries(schema))if(expected.kind==='function'){
+    for(const [role,expected]of Object.entries(schema))if(required.has(role)&&expected.kind==='function'&&!projectedRoles.has(role)){
         const rules=[expected,...(expected.variants||[])].map(rule=>projectRuntimeRule(rule,role));
         schema[role]={...rules[0],...rules.length>1?{variants:rules.slice(1)}:{}};
     }
@@ -2654,7 +2636,8 @@ function adaptGameSource(source,schema=adaptiveSchema()) {
         for(const [role,name]of pending)if(!bindings.has(role)){bindings.set(role,name);reverse.set(name,role);changed=true;}
         return changed;
     };
-    for(const [name,row]of definitions)if(row.kind==='function'&&row.body.length<1000&&adaptiveDescription(row,definitions).shape===schema.cn.shape){
+    for(const name of candidates.get('function:'+schema.cn.shape)||[]){
+        const row=definitions.get(name);if(row.kind!=='function'||row.body.length>=1000)continue;
         const match=/^return([\s\S]*?);?$/.exec(row.body),params=tokenize(row.params).filter(token=>token.type==='name').map(token=>token.value);
         if(match)tableCalls[name]=(...args)=>{if(args.length!==params.length)throw Error('配方构造器参数变化');return parseExpression(match[1],readData,{},Object.fromEntries(params.map((param,index)=>[param,args[index]])));};
     }
@@ -3036,17 +3019,16 @@ return adaptGameSource;
             if(cache.has(name))return cache.get(name);
             if(active.has(name))fail(`循环常量 ${name}`);
             active.add(name);
-            try{const value=adapted.records(name)??(adapted.data?adapted.data(name):parseExpression(initializer(name),read,calls));cache.set(name,value);return value;}
+            try{const value=adapted.records(name)??adapted.data(name);cache.set(name,value);return value;}
             finally{active.delete(name);}
         };
         const body=name=>adapted.body(name);
         const requirePattern=(name,pattern)=>{const text=body(name).text;if(!pattern.test(text))fail(`函数 ${name} 的规则结构已变化`);return text;};
         const verifyRule=(name,pattern)=>adapted.reviewed?.(name)===true?body(name).text:requirePattern(name,pattern);
-        for(const name of ['cn']){
-            let params,text;
-            if(name==='cn'){const fn=body(name),match=/^return([\s\S]*?);?$/.exec(fn.text);if(!match)fail('配方构造器结构变化');params=fn.params;text=match[1];}
-            else {const match=/^([A-Za-z_$][\w$]*)=>([\s\S]+)$/.exec(initializer(name));if(!match)fail('升级材料构造器结构变化');params=[match[1]];text=match[2];}
-            calls[name]=(...args)=>{if(args.length!==params.length)fail('构造器参数变化');return parseExpression(text,read,calls,Object.fromEntries(params.map((p,i)=>[p,args[i]])));};
+        {
+            const {params,text}=body('cn'),match=/^return([\s\S]*?);?$/.exec(text);
+            if(!match)fail('配方构造器结构变化');
+            calls.cn=(...args)=>{if(args.length!==params.length)fail('构造器参数变化');return parseExpression(match[1],read,calls,Object.fromEntries(params.map((p,i)=>[p,args[i]])));};
         }
         const exact=(name,expected)=>{if(initializer(name)!==expected)fail(`数据组合 ${name} 已变化`);};
         const activeJobs=initializer('xo');
@@ -3752,7 +3734,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         for (const k of Object.keys(defaults)) if (typeof saved[k] === typeof defaults[k]) prefs[k] = saved[k];
     } catch (_) {}
     if (!routePriorities.some(([id]) => id === prefs.routePriority)) prefs.routePriority = defaults.routePriority;
-    prefs.hiddenTasks = Array.isArray(prefs.hiddenTasks) ? [...new Set(prefs.hiddenTasks.filter(id => typeof id === 'string' && /^(collection|forge):[\w:-]+$/.test(id)))].slice(0,2000) : [];
+    prefs.hiddenTasks = Array.isArray(prefs.hiddenTasks) ? [...new Set(prefs.hiddenTasks.filter(id => typeof id === 'string' && /^(collection|forge):[\w:-]+$/.test(id)))].slice(0,20000) : [];
     const hiddenTasks = new Set(prefs.hiddenTasks), endlessTargets = new Map();
     let preparedEndless = null, taskListTab = 'route', automaticWorkClick = false, monitorRestored = false, monitorSaved = null;
     let disposed = false, root, panel, opinionPopup, shadow, toastTimer, poll, pollBusy = false, exportRestore = null, syncTimer;
@@ -3769,6 +3751,9 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
     let presenceBusy = false;
     const presenceDays = new Map();
     let plan = { tasks:[], summary:{} }, active = null, complete = false, skipped = new Set();
+    let titleGoal = null, titleNotice = false;
+    const completionTitlePrefix = '【精通任务完成】 ';
+    const titleObserver = new MutationObserver(() => updateCompletionTitle());
     const routeCache = new Map(), marketBooks = new Map(), marketAsked = new Map(), routePages = {route:0,hidden:0};
     const PAGE_SIZE = 50;
     const MARKET_TTL = 60000, MARKET_BATCH_INTERVAL = 15000;
@@ -3816,9 +3801,9 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (unit < 2 && Math.round(Math.abs(value)/1000**(unit+1)*100)/100 >= 1000) unit++;
         return `${moneyNumbers.format(value/1000**(unit+1))}${['K','M','B'][unit]}`;
     };
-    const duration = seconds => !Number.isFinite(seconds) || seconds < 0 ? '时间不定' : seconds < 60 ? `${seconds > 0 && seconds < .1 ? '<0.1' : fmt(seconds)} s` : `${fmt(seconds / 60)} min`;
+    const duration = seconds => !Number.isFinite(seconds) || seconds < 0 ? '时间不定' : seconds < 60 ? `${seconds > 0 && seconds < .1 ? '<0.1' : fmt(seconds)} s` : seconds < 3600 ? `${fmt(seconds / 60)} min` : seconds < 86400 ? `${fmt(seconds / 3600)} 小时` : `${fmt(seconds / 86400)} 天`;
     const time = seconds => Number.isFinite(seconds) && seconds >= 0 ? `约 ${duration(seconds)}` : '时间不定';
-    const taskTime = task => task.expectedSeconds == null ? time(task.seconds) : `${task.secondsNeedsScrolls ? '补齐卷轴 ' : ''}${task.secondsConservative ? '保守估算 ' : task.secondsBaseline ? '基础估算 ' : ''}${task.kind === 'farm' ? '单田·成熟即收 ' : task.uncertainAttempts || task.kind === 'forge' && task.targetPlus > 1 ? '期望' : ''}${time(task.expectedSeconds)}`;
+    const taskTime = task => task.expectedSeconds == null ? time(task.seconds) : `${task.secondsNeedsScrolls ? '补齐卷轴 ' : ''}${task.burnLossExcluded ? '按制造数量估算 ' : `${task.secondsConservative ? '保守估算 ' : task.secondsBaseline ? '基础估算 ' : ''}${task.kind === 'farm' ? '单田·成熟即收 ' : task.uncertainAttempts || task.kind === 'forge' && task.targetPlus > 1 ? '期望' : ''}`}${time(task.expectedSeconds)}`;
     const itemNames = new Map();
     const itemName = id => {
         id = Number(id);
@@ -3886,6 +3871,31 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
             osc.connect(gain); gain.connect(ctx.destination); osc.frequency.value = 720; gain.gain.value = .045;
             osc.start(); osc.stop(ctx.currentTime + .15); osc.onended = () => ctx.close();
         } catch (_) {}
+    }
+    function updateCompletionTitle() {
+        if (!disposed && titleNotice && !document.title.startsWith(completionTitlePrefix)) document.title = completionTitlePrefix + document.title;
+    }
+    function clearTitleMonitor() {
+        titleObserver.disconnect();
+        if (titleNotice && document.title.startsWith(completionTitlePrefix)) document.title = document.title.slice(completionTitlePrefix.length);
+        titleGoal = null; titleNotice = false;
+    }
+    function titleGoalComplete(task, person) {
+        if (task.kind === 'forge') return person.completeness?.forgeLog ? CORE.forgeHasStep(person.forgeLog?.[task.forgeKey] || 0,task.targetPlus) : null;
+        return person.completeness?.collections ? (person.collections[task.itemId] || 0) >= task.target : null;
+    }
+    function watchTitleTask(task) {
+        clearTitleMonitor();
+        if (!task || !live || !catalogVerified || !CORE.taskAvailable(task,DATA,character) || titleGoalComplete(task,character) !== false) return;
+        const {id,kind,itemId,target,forgeKey,targetPlus} = task;
+        titleGoal = {task:{id,kind,itemId,target,forgeKey,targetPlus},person:{id:character.id,name:character.name},done:false};
+    }
+    function checkTitleGoal() {
+        if (!live || titleGoal && !samePerson(titleGoal.person,character)) { clearTitleMonitor(); return; }
+        if (!catalogVerified || !titleGoal || titleGoal.done || titleGoalComplete(titleGoal.task,character) !== true) return;
+        titleGoal.done = true; titleNotice = true;
+        if (document.head) titleObserver.observe(document.head,{childList:true,subtree:true,characterData:true});
+        updateCompletionTitle();
     }
     function watchGame() {
         if (disposed || document.hidden) return;
@@ -4046,13 +4056,45 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (booksChanged) { effectivePrices = null; planDeferred = true; }
         return booksChanged;
     }
+    function manufacturingMilestoneKey(task) {
+        if (!task || !['craft','upgrade'].includes(task.kind) || ![0,1,2].includes(task.rarity) || ![1,10,100].includes(task.target)) return null;
+        const sourceId = task.kind === 'craft' && task.sourceType === 'output' ? null : task.sourceId;
+        return JSON.stringify([task.kind,task.itemId,task.jobId,task.recipeId,sourceId]);
+    }
+    function withMergedMilestones(task, members) {
+        return members.length < 2 ? task : {...task,mergedMilestoneIds:members.map(t=>t.id),mergedMilestoneTargets:[...new Set(members.map(t=>t.target))].sort((a,b)=>a-b)};
+    }
+    function mergeManufacturingMilestones(tasks) {
+        const groups = new Map(), rows = [];
+        for (const task of tasks) {
+            const key = manufacturingMilestoneKey(task);
+            if (key === null) { rows.push(task); continue; }
+            let group = groups.get(key);
+            if (!group) { group = {index:rows.length,members:[]}; groups.set(key,group); rows.push(task); }
+            group.members.push(task);
+        }
+        const priority = task => task.monitoredGoal ? 3 : !complete && task.id === active?.id ? 2 : queuedWork(task) ? 1 : 0;
+        for (const {index,members} of groups.values()) {
+            if (members.length < 2) continue;
+            const task = members.reduce((best,t) => priority(t) > priority(best) || priority(t) === priority(best) && t.target > best.target ? t : best);
+            rows[index] = withMergedMilestones(task,members);
+        }
+        return rows;
+    }
+    function mergedMilestoneLabel(task) {
+        if (!task.mergedMilestoneTargets?.length) return '';
+        const target = task.target < Math.max(...task.mergedMilestoneTargets) ? `（${task.monitoredGoal ? '保留停止目标' : '本次目标'} ${fmt(task.target)}）` : '';
+        return `${task.mergedMilestoneTargets.join('/')} 档合并${target}`;
+    }
     function routeKey(hidden) {
         const quality = hasQualityFilter() ? prefs.rarity : 'all';
-        return `${hidden}:${prefs.category}:${prefs.skill}:${quality}:${prefs.showLocked}:${prefs.materialPriceSort}:${prefs.routePriority}:${searchWords.join(' ')}`;
+        const selected = !complete && manufacturingMilestoneKey(active) ? active.id : '';
+        return `${hidden}:${prefs.category}:${prefs.skill}:${quality}:${prefs.showLocked}:${prefs.materialPriceSort}:${prefs.routePriority}:${searchWords.join(' ')}:${selected}`;
     }
     function routeInputs(hidden, tasks = plan.tasks, routePrices = quotes()) {
         const quality = hasQualityFilter() ? prefs.rarity : 'all';
         tasks = tasks.filter(t => hiddenTasks.has(t.id) === hidden && (prefs.showLocked || !t.locked || queuedWork(t)) && matchesFilter(t) && matchesSearch(t) && (quality === 'all' || t.rarity === Number(quality)));
+        tasks = mergeManufacturingMilestones(tasks);
         return {tasks,options:{ fullRoute:true, independentTasks:true, allMilestones:true, prices:routePrices, materialCostSort:prefs.materialPriceSort, routePriority:prefs.routePriority === 'default' ? null : prefs.routePriority, excludedTaskIds:[...skipped] }};
     }
     const planningKey = () => JSON.stringify([tab,routeKey(false),[...hiddenTasks],[...skipped],monitorSaved]);
@@ -4155,6 +4197,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (!catalogVerified) { character = next; live = isLive; lastSync = Date.now(); render(); return; }
         const changed = character && !samePerson(character, next);
         if (changed) {
+            clearTitleMonitor();
             active = null; complete = false; skipped.clear(); signature = ''; availablePoints = null;
             plan = {tasks:[],summary:{}}; planSource = routeSource = null; routeCache.clear(); listViews.clear();
             if (root && !prefs.collapsed) root.style.visibility = 'hidden';
@@ -4190,6 +4233,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         }
         const previousPoints = availablePoints, previousCoins = character?.coins;
         character = next; live = isLive; lastSync = Date.now();
+        checkTitleGoal();
         const derivedPoints = isLive ? unspentPoints(next) : null;
         if (!CORE.featureAvailable(DATA,'enhancing') || !next.completeness.forgeLog) availablePoints = null;
         else if (derivedPoints !== null) availablePoints = derivedPoints;
@@ -4237,7 +4281,6 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
             }
             const sourcePlan = planSource, reusableRoutes = routeSource?.plan === sourcePlan && routeSource.coins === person.coins && routeSource.monitor === monitorSaved;
             const nextPlan = {tasks:sourcePlan.result.tasks.slice(),summary:{...sourcePlan.result.summary}};
-            nextPlan.summary.readyCount = CORE.readyCount(nextPlan.tasks,person);
             for (const [jobId,group] of endlessTargets) if (group.seen) for (const [itemId,goal] of group.targets) {
                 if (!workAvailable(jobId) || isPetGoal(itemId,goal)) continue;
                 const order = person.workOrders.find(order => goalMatchesOrder(order,jobId,itemId,goal));
@@ -4275,13 +4318,18 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
                 task.awaitingStop = canAutoStop(task) && (person.collections[itemId] || 0) >= goal.target;
                 task.stopIssue = canAutoStop(task) ? group.blocked || '' : '';
             }
+            nextPlan.summary.readyCount = CORE.readyCount(mergeManufacturingMilestones(nextPlan.tasks),person);
             const routes = new Map(), lists = new Set();
             if (tab === 'task') lists.add(taskListTab === 'hidden');
             else if (tab === 'route' || tab === 'hidden') lists.add(tab === 'hidden');
             if (!active) lists.add(false);
             for (const hidden of lists) {
-                const key = routeKey(hidden), {tasks,options} = routeInputs(hidden,nextPlan.tasks,sourcePrices);
-                routes.set(key,reusableRoutes && routeCache.has(key) ? routeCache.get(key) : yield* CORE.routeSteps(tasks,person,DATA,options));
+                const key = routeKey(hidden);
+                if (reusableRoutes && routeCache.has(key)) routes.set(key,routeCache.get(key));
+                else {
+                    const {tasks,options} = routeInputs(hidden,nextPlan.tasks,sourcePrices);
+                    routes.set(key,yield* CORE.routeSteps(tasks,person,DATA,options));
+                }
             }
             if (!current()) throw new DOMException('任务状态已变化','AbortError');
             // Finish a coherent snapshot, then merge any updates received while yielding.
@@ -4295,7 +4343,11 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
             if (active) {
                 const previous = active;
                 const updated = plan.tasks.find(t => t.id === active.id) || plan.tasks.find(t => t.itemId === active.itemId && t.target === active.target && t.kind === active.kind);
-                if (updated) active = {...updated};
+                if (updated) {
+                    const key = manufacturingMilestoneKey(updated);
+                    const members = key === null ? [updated] : plan.tasks.filter(t=>manufacturingMilestoneKey(t) === key && hiddenTasks.has(t.id) === hiddenTasks.has(updated.id));
+                    active = {...withMergedMilestones(updated,members)};
+                }
                 let done = false;
                 if (active.kind === 'forge') done = CORE.forgeHasStep(character.forgeLog?.[active.forgeKey] || 0,active.targetPlus);
                 else {
@@ -4577,7 +4629,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
     }
     async function monitorTick(force = false) {
         if (disposed || (character && !live && !force)) return;
-        if (!force && document.hidden && monitorRestored && !endlessTargets.size && !preparedEndless && !pendingForgeEvents.length) return;
+        if (!force && document.hidden && monitorRestored && !endlessTargets.size && !preparedEndless && !pendingForgeEvents.length && (!titleGoal || titleGoal.done)) return;
         flushRaw();
         if (pollBusy) { scheduleSync(100); return; }
         if (!force && Date.now() - lastReadAt < (syncUrgent ? 100 : syncInterval())) { scheduleSync(); return; }
@@ -4851,22 +4903,24 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (canMonitor(task) && mode === 'endless' && live && (!start.disabled || queue && !queue.disabled)) preparedEndless = { ...task, person:identity, generation:sessionGeneration };
         if (!start.disabled) start.focus({ preventScroll:true });
         if (start.disabled && (!queue || queue.disabled)) { notify('已展开目标与次数；请按游戏提示补齐开始条件'); return; }
-        notify(mode === 'endless' ? `${workName(task)} - 无限次数${canAutoStop(task) && live ? '，达标后自动移出队列' : '，达标后手动停止'}` : task.batches > 1000000 ? '本次已填 100 万次；完成后可继续此任务' : `${workName(task)} - 已填 ${fmt(task.batches)} 次，点击游戏“开始”`);
+        notify(mode === 'endless' ? `${workName(task)} - 无限次数${canAutoStop(task) && live ? '，达标后自动移出队列' : '，达标后手动停止'}` : task.batches > 1000000 ? '本次已填 100 万次；完成后可继续此任务' : task.uncertainAttempts ? `${workName(task)} - 已按估算填 ${fmt(task.batches)} 次，结束后核对自产数量` : `${workName(task)} - 已填 ${fmt(task.batches)} 次，点击游戏“开始”`);
     }
     function selectTask(id) {
         const task = routeFor(tab === 'hidden').tasks.find(t=>t.id === id) || plan.tasks.find(t=>t.id === id);
         if (!CORE.taskAvailable(task,DATA,character)) return;
         taskListTab = tab === 'hidden' ? 'hidden' : 'route';
         active = { ...task, monitorFinite:queuedWork(task) }; complete = task.current >= task.target; navigationToken++; tab = 'task';
+        watchTitleTask(active);
         marketCheckAt = 0;
         if (queuedWork(task)) { trackEndless(active,true,true,true); scheduleSync(100); }
         render();
         if (queuedWork(task)) notify(`${taskItemName(task)} - ${queueStatusText(task)}${canAutoStop(active) && !complete ? ' - 达标自动移除' : ''}`);
     }
     function nextTask(skip = false) {
-        if (active) skipped.add(active.id);
+        if (active) for (const id of skip && active.mergedMilestoneIds || [active.id]) skipped.add(id);
         routeCache.clear();
         active = nextAvailable(); taskListTab = 'route';
+        watchTitleTask(active);
         complete = false; navigationToken++; tab = active ? 'task' : 'route'; render();
         if (!active) notify(skip ? '已跳过；可在路线中重新选择' : '当前路线已看完，可切换技能');
     }
@@ -4885,6 +4939,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         return [
             t.kind === 'combat' || t.sourceType ? workName(t) : '',
             locked ? `${skills[t.skill] || t.skill} ${t.levelReq}级解锁` : t.kind === 'forge' ? `当前 +${t.currentPlus}` : `${fmt(t.current)} / ${fmt(t.target)}`,
+            mergedMilestoneLabel(t),
             locked ? '' : taskTime(t),
             t.kind === 'forge' ? `平均成功率 ${fmt(CORE.forgeSuccessPercent(t))}%` : '',
             t.randomOutput && t.rarity > 0 ? '随机' : '',
@@ -4958,6 +5013,12 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (!character.completeness.workOrders) return '队列待同步';
         return material.reservationUncertain ? '队列占用不定' : '';
     }
+    function productionUncertainty(task) {
+        if (!task.uncertainAttempts) return '';
+        if (task.burnLossExcluded) return `按制造数量准备 ${fmt(task.estimatedBatches)} 次；以实际自产进度为准`;
+        const reasons = [task.burnChance > 0 ? '烹饪可能烧焦' : '',task.caughtChance > 0 ? '行动可能被抓' : '',task.randomOutput ? '目标产出有随机性' : ''].filter(Boolean);
+        return `${reasons.join('；') || '制作可能失败'}；${task.kind === 'craft' && task.stopMode === 'count' ? `按估算 ${fmt(task.estimatedBatches)} 次准备材料和次数，可能仍未达标` : '以实际自产进度为准'}`;
+    }
     function taskHTML() {
         if (!active) return '<div class="empty">从路线中选择一项任务</div>';
         const t = active, progress = complete ? 100 : Math.max(0, Math.min(100, (t.progress || 0) * 100));
@@ -4965,7 +5026,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         const materialTotal = CORE.purchaseCost(t.materials,quotes(),0,true);
         const totalLabel = materialTotal === null ? prices ? '未报价' : quoteStatus() : `${fmtMoney(materialTotal)} 金币`;
         const purchaseLabel = t.materials.map(materialQueueIssue).find(Boolean) || (t.cost === 0 ? '无需补买' : t.cost == null ? prices ? '未报价' : quoteStatus() : `${fmtMoney(t.cost)} 金币`);
-        const warning = t.routeUnsupported ? '被动技能宠物：完成该技能动作时随机获得' : t.stopIssue || (t.awaitingStop ? '已达标 - 等待停止确认' : t.locked ? `${skills[t.skill] || t.skill} 达到 ${t.levelReq} 级解锁` : t.forgeNeedsDeposit ? '强化装备在背包，请先存入仓库' : complete && t.stopMode === 'endless' && !canAutoStop(t) ? '目标已完成，请点击游戏“停止”' : t.uncertainAttempts ? '随机产出或可能失败；以实际自产进度为准' : '');
+        const warning = t.routeUnsupported ? '被动技能宠物：完成该技能动作时随机获得' : t.stopIssue || (t.awaitingStop ? '已达标 - 等待停止确认' : t.locked ? `${skills[t.skill] || t.skill} 达到 ${t.levelReq} 级解锁` : t.forgeNeedsDeposit ? '强化装备在背包，请先存入仓库' : complete && t.stopMode === 'endless' && !canAutoStop(t) ? '目标已完成，请点击游戏“停止”' : productionUncertainty(t));
         const queueStatus = queuedWork(t) ? `<span class="queue-status" data-task-queue-status data-queue-status="${t.queueStatus}" title="${esc(queueLabel(t))}">${queueStatusText(t)}</span>` : '';
         const materials = t.materials.length ? `<div class="materials">${t.materials.map(m => {
             const quote = quotes()[m.itemId];
@@ -4977,6 +5038,8 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         }).join('')}</div>` : '';
         return `<div class="task-head"><div class="task-title"><h2 class="task-heading" title="${esc(taskItemName(t))}">${taskTitleHTML(t)}</h2>${t.kind === 'forge' ? '' : `<small>${esc(skills[t.skill] || t.skill)} - ${t.levelReq}级</small>`}</div><span class="route-end">${queueStatus}<span class="gain">+${fmt(t.gain)} 点</span></span></div>
             <div class="progress"><i style="width:${progress}%"></i></div><div class="between"><strong>${complete ? '已完成 ✓' : t.kind === 'forge' ? `目标 +${t.targetPlus}` : `${fmt(t.current)} / ${fmt(t.target)}`}</strong><span class="muted">${complete ? '' : taskTime(t)}</span></div>
+            ${mergedMilestoneLabel(t) ? `<p class="muted" data-merged-milestones>${esc(mergedMilestoneLabel(t))}</p>` : ''}
+            ${titleGoal?.task.id === t.id ? `<p class="muted" data-title-monitor>${titleGoal.done ? '已完成，浏览器标题已提醒' : '已监控此目标，达标后提醒浏览器标题'}</p>` : ''}
             ${warning ? `<p class="warning">${esc(warning)}</p>` : ''}
             ${t.materialsConservative ? '<p class="muted" data-materials-conservative>材料按未触发节省估算，实际消耗可能更少。</p>' : ''}
             ${t.kind === 'forge' ? `<div class="estimate"><div class="between"><span class="muted">成功率</span><span>${esc(fmt(CORE.forgeSuccessPercent(t)))}%</span></div><div class="between"><span class="muted">期望消耗</span><span>${esc(forgeConsumption(t))}</span></div></div>` : ''}
@@ -5341,9 +5404,16 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
                 }
                 if (action === 'hide' || action === 'restore') {
                     const id = button.dataset.taskId;
-                    if (!plan.tasks.some(t => t.id === id)) return;
-                    if (action === 'hide') hiddenTasks.add(id); else hiddenTasks.delete(id);
-                    prefs.hiddenTasks = [...hiddenTasks]; routeCache.clear(); savePrefs(); render(); return;
+                    const hidden = action === 'restore', route = routeFor(hidden);
+                    const task = route.tasks.find(t=>t.id === id);
+                    if (!task) return;
+                    const members = new Set(task.mergedMilestoneIds || [id]);
+                    for (const memberId of members) {
+                        if (action === 'hide') hiddenTasks.add(memberId); else hiddenTasks.delete(memberId);
+                    }
+                    prefs.hiddenTasks = [...hiddenTasks]; routeCache.clear(); routeSource = null;
+                    cacheRoute(routeKey(hidden),{...route,tasks:route.tasks.filter(t=>!members.has(t.id))});
+                    savePrefs(); render(); replan(false,false,true); return;
                 }
                 if (action === 'next' || action === 'skip') { nextTask(action === 'skip'); return; }
                 if (action === 'reset') { prefs.docked = true; savePrefs(); scheduleLayout(); return; }
@@ -5669,6 +5739,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         }
     }
     function dispose() {
+        clearTitleMonitor();
         if (disposed) return; disposed = true; navigationToken++; sessionGeneration++;
         rejectMount(new DOMException('助手已关闭','AbortError'));
         abort.abort(); updater?.dispose(); clearInterval(poll); for (const timer of timers) clearTimeout(timer); timers.clear();
@@ -5704,6 +5775,7 @@ function bootMasteryAssistant(CORE, DATA, earlySockets, updater, retained, catal
         if (disposed) return;
         catalogVerified = verified; catalogMessage = message || '任务数据正在更新';
         if (!verified) {
+            clearTitleMonitor();
             endlessTargets.clear(); preparedEndless = null;
             planRevision++; planning = false; planDeferred = true;
             navigationToken++; active = null; complete = false; availablePoints = null; signature = ''; planError = '';
